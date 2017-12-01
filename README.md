@@ -9,5 +9,10 @@ The Go client library for TIBCO eFTL messaging.
 go get github.com/TIBCOSoftware/eftl
 ```
 
+## Examples
+```bash
+go install github.com/TIBCOSoftware/eftl...
+```
+
 ## License
 See LICENSE.txt.
