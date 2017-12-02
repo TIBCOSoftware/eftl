@@ -8,7 +8,7 @@ import (
 	"flag"
 	"log"
 
-	"github.org/TIBCOSoftware/eftl"
+	"github.com/TIBCOSoftware/eftl"
 )
 
 func main() {
