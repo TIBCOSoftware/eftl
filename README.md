@@ -16,3 +16,6 @@ go install github.com/TIBCOSoftware/eftl...
 
 ## License
 See LICENSE.txt.
+
+## Support
+Support is available at [TIBCO Community](https://community.tibco.com/).
