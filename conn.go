@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync"
@@ -26,6 +27,8 @@ var (
 	ErrShuttingDown     = errors.New("server is shutting down")
 	ErrForceClose       = errors.New("server has forcibly closed the connection")
 	ErrNotAuthorized    = errors.New("not authorized for the operation")
+	ErrBadHandshake     = errors.New("bad handshake")
+	ErrNotFound         = errors.New("not found")
 )
 
 // Options available to configure the connection.
@@ -374,8 +377,14 @@ func (conn *Connection) connect() error {
 		Host:   conn.URL.Host,
 		Path:   conn.URL.Path,
 	}
-	ws, _, err := d.Dial(u.String(), nil)
-	if err != nil {
+	ws, resp, err := d.Dial(u.String(), nil)
+	if err == websocket.ErrBadHandshake {
+		if resp.StatusCode == http.StatusNotFound {
+			return ErrNotFound
+		} else {
+			return ErrBadHandshake
+		}
+	} else if err != nil {
 		return err
 	}
 	conn.ws = ws
