@@ -1,4 +1,4 @@
-// Copyright © 2017. TIBCO Software Inc.
+// Copyright © 2017-2018. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -6,8 +6,9 @@ package eftl
 
 import (
 	"crypto/tls"
-	"errors"
 	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,18 +18,23 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+type eftlError struct {
+	msg string
+}
+
+func (e *eftlError) Error() string { return e.msg }
+
 // Errors
 var (
-	ErrTimeout          = errors.New("operation timed out")
-	ErrNotConnected     = errors.New("not connected")
-	ErrInvalidResponse  = errors.New("received invalid response from server")
-	ErrMessageTooBig    = errors.New("message too big")
-	ErrNotAuthenticated = errors.New("not authenticated")
-	ErrShuttingDown     = errors.New("server is shutting down")
-	ErrForceClose       = errors.New("server has forcibly closed the connection")
-	ErrNotAuthorized    = errors.New("not authorized for the operation")
-	ErrBadHandshake     = errors.New("bad handshake")
-	ErrNotFound         = errors.New("not found")
+	ErrTimeout          = &eftlError{msg: "operation timed out"}
+	ErrNotConnected     = &eftlError{msg: "not connected"}
+	ErrInvalidResponse  = &eftlError{msg: "received invalid response from server"}
+	ErrMessageTooBig    = &eftlError{msg: "message too big"}
+	ErrNotAuthenticated = &eftlError{msg: "not authenticated"}
+	ErrForceClose       = &eftlError{msg: "server has forcibly closed the connection"}
+	ErrNotAuthorized    = &eftlError{msg: "not authorized for the operation"}
+	ErrBadHandshake     = &eftlError{msg: "bad handshake"}
+	ErrNotFound         = &eftlError{msg: "not found"}
 )
 
 // Options available to configure the connection.
@@ -57,23 +63,45 @@ type Options struct {
 	// HandshakeTimeout specifies the duration for the websocket handshake
 	// with the server to complete. The default is 10 seconds.
 	HandshakeTimeout time.Duration
+
+	// AutoReconnectAttempts specifies the number of times the client attempts to
+	// automatically reconnect to the server following a loss of connection.
+	// The default is 5.
+	AutoReconnectAttempts int64
+
+	// AutoReconnectMaxDelay determines the maximum delay between autoreconnect attempts.
+	// Upon loss of a connection, the client will delay for 1 second before attempting to
+	// automatically reconnect. Subsequent attempts double the delay duration, up to
+	// the maximum value specified. The default is 30 seconds.
+	AutoReconnectMaxDelay time.Duration
 }
 
 // Connection represents a connection to the server.
 type Connection struct {
-	URL         *url.URL
-	Options     Options
-	ErrorChan   chan error
-	reconnectID string
-	wg          sync.WaitGroup
-	mu          sync.Mutex
-	ws          *websocket.Conn
-	connected   bool
-	pubs        []*Completion
-	pubSeqNum   int64
-	subs        map[string]*Subscription
-	subSeqNum   int64
-	lastSeqNum  int64
+	URL               *url.URL
+	Options           Options
+	ErrorChan         chan error
+	reconnectID       string
+	wg                sync.WaitGroup
+	mu                sync.Mutex
+	ws                *websocket.Conn
+	connected         bool
+	pubs              []*Completion
+	pubSeqNum         int64
+	subs              map[string]*Subscription
+	subSeqNum         int64
+	lastSeqNum        int64
+	reconnectAttempts int64
+	reconnectTimer    *time.Timer
+}
+
+// Options available to configure a subscription.
+type SubscriptionOptions struct {
+	// Durable subscription type; "shared" or "last-value".
+	DurableType string
+
+	// Key field for "last-value" durable subscriptions.
+	DurableKey string
 }
 
 // Subscription represents an interest in application messages.
@@ -82,10 +110,31 @@ type Connection struct {
 type Subscription struct {
 	Matcher          string
 	Durable          string
+	Options          SubscriptionOptions
 	MessageChan      chan Message
 	Error            error
 	subscriptionID   string
 	subscriptionChan chan *Subscription
+}
+
+func (sub *Subscription) toProtocol() Message {
+	msg := Message{
+		"op": opSubscribe,
+		"id": sub.subscriptionID,
+	}
+	if sub.Matcher != "" {
+		msg["matcher"] = sub.Matcher
+	}
+	if sub.Durable != "" {
+		msg["durable"] = sub.Durable
+	}
+	if sub.Options.DurableType != "" {
+		msg["type"] = sub.Options.DurableType
+	}
+	if sub.Options.DurableKey != "" {
+		msg["key"] = sub.Options.DurableKey
+	}
+	return msg
 }
 
 // Completion represents a completed publish operation. When returned
@@ -194,6 +243,10 @@ func (conn *Connection) Disconnect() {
 	conn.sendMessage(Message{
 		"op": opDisconnect,
 	})
+	// cancel the reconnect timer
+	if conn.reconnectTimer != nil {
+		conn.reconnectTimer.Stop()
+	}
 	// close the connection to the server
 	conn.disconnect()
 	conn.mu.Unlock()
@@ -316,17 +369,53 @@ func (conn *Connection) SubscribeAsync(matcher string, durable string, messageCh
 	}
 	conn.subs[sid] = sub
 	// send subscribe protocol
-	msg := Message{
-		"op": opSubscribe,
-		"id": sid,
+	return conn.sendMessage(sub.toProtocol())
+}
+
+// Subscribe registers interest in application messages.
+// A content matcher can be used to register interest in certain messages.
+// A durable name can be specified to create a durable subscription.
+// Messages are received on the messageChan.
+//
+func (conn *Connection) SubscribeWithOptions(matcher string, durable string, options SubscriptionOptions, messageChan chan Message) (*Subscription, error) {
+	subscriptionChan := make(chan *Subscription, 1)
+	if err := conn.SubscribeWithOptionsAsync(matcher, durable, options, messageChan, subscriptionChan); err != nil {
+		return nil, err
 	}
-	if matcher != "" {
-		msg["matcher"] = matcher
+	select {
+	case sub := <-subscriptionChan:
+		return sub, sub.Error
+	case <-time.After(conn.Options.Timeout):
+		return nil, ErrTimeout
 	}
-	if durable != "" {
-		msg["durable"] = durable
+}
+
+// Subscribe registers interest in application messages asynchronously.
+// A content matcher can be used to register interest in certain messages.
+// A durable name can be specified to create a durable subscription.
+// Messages are received on the messageChan. The subscriptionChan
+// will receive notification once the subscribe operation completes.
+//
+func (conn *Connection) SubscribeWithOptionsAsync(matcher string, durable string, options SubscriptionOptions, messageChan chan Message, subscriptionChan chan *Subscription) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.connected {
+		return ErrNotConnected
 	}
-	return conn.sendMessage(msg)
+	// register the subscription
+	conn.subSeqNum++
+	sid := strconv.FormatInt(conn.subSeqNum, 10)
+	sub := &Subscription{
+		Matcher:          matcher,
+		Durable:          durable,
+		Options:          options,
+		MessageChan:      messageChan,
+		subscriptionID:   sid,
+		subscriptionChan: subscriptionChan,
+	}
+	conn.subs[sid] = sub
+	// send subscribe protocol
+	return conn.sendMessage(sub.toProtocol())
 }
 
 // Unsubscribe unregisters the subscription.
@@ -450,19 +539,11 @@ func (conn *Connection) connect() error {
 	}
 	// mark the connection as connected
 	conn.connected = true
+	// reset the reconnect attempts
+	conn.reconnectAttempts = 0
 	// re-establish subscriptions
 	for _, sub := range conn.subs {
-		msg := Message{
-			"op": opSubscribe,
-			"id": sub.subscriptionID,
-		}
-		if sub.Matcher != "" {
-			msg["matcher"] = sub.Matcher
-		}
-		if sub.Durable != "" {
-			msg["durable"] = sub.Durable
-		}
-		conn.sendMessage(msg)
+		conn.sendMessage(sub.toProtocol())
 	}
 	if resume {
 		// re-send unacknowledged messages
@@ -495,7 +576,12 @@ func (conn *Connection) dispatch() {
 		// read the next message
 		msg, err := conn.nextMessage()
 		if err != nil {
-			conn.handleDisconnect(err)
+			// only unexpected errors will trigger a reconnect
+			if _, ok := err.(*eftlError); ok {
+				conn.handleDisconnect(err)
+			} else {
+				conn.handleReconnect(err)
+			}
 			break
 		}
 		// process the message
@@ -514,6 +600,24 @@ func (conn *Connection) dispatch() {
 			case opError:
 			}
 		}
+	}
+}
+
+func (conn *Connection) handleReconnect(err error) {
+	if conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+		// exponential backoff truncated to max delay
+		dur := time.Duration(math.Pow(2.0, float64(conn.reconnectAttempts))) * time.Second
+		if dur > conn.Options.AutoReconnectMaxDelay {
+			dur = conn.Options.AutoReconnectMaxDelay
+		}
+		conn.reconnectAttempts++
+		conn.reconnectTimer = time.AfterFunc(dur, func() {
+			if e := conn.connect(); e != nil {
+				conn.handleReconnect(err)
+			}
+		})
+	} else {
+		conn.handleDisconnect(err)
 	}
 }
 
@@ -642,16 +746,16 @@ func (conn *Connection) nextMessage() (msg Message, err error) {
 	// translate a websocket.CloseError
 	if closeErr, ok := err.(*websocket.CloseError); ok {
 		switch closeErr.Code {
-		case 1001:
-			err = ErrShuttingDown
-		case 1009:
+		case websocket.CloseAbnormalClosure:
+			err = io.ErrUnexpectedEOF
+		case websocket.CloseMessageTooBig:
 			err = ErrMessageTooBig
 		case 4000:
 			err = ErrForceClose
 		case 4002:
 			err = ErrNotAuthenticated
 		default:
-			err = errors.New(closeErr.Text)
+			err = &eftlError{msg: closeErr.Error()}
 		}
 	}
 	return

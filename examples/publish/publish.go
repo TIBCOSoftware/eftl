@@ -1,4 +1,4 @@
-// Copyright © 2017. TIBCO Software Inc.
+// Copyright © 2017-2018. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -25,8 +25,8 @@ func main() {
 		Password: "pass",
 	}
 
-	// Connect. 
-	conn, err := eftl.Connect("wss://localhost:8080/channel", opts, errChan)
+	// Connect.
+	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
 	if err != nil {
 		log.Println("connect failed:", err)
 		return
@@ -59,13 +59,14 @@ func main() {
 		"type": "example",
 		"text": "This is an example message",
 		"long": int64(101),
-		"date": time.Now(),
+		"time": time.Now(),
 	}
 
-	// Publish the message. 
+	// Publish the message.
 	err = conn.Publish(msg)
 	if err != nil {
 		log.Println("publish failed:", err)
+		return
 	}
 
 	log.Println("published message:", msg)

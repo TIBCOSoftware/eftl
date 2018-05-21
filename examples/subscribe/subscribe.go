@@ -1,4 +1,4 @@
-// Copyright © 2017. TIBCO Software Inc.
+// Copyright © 2017-2018. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -31,8 +31,8 @@ func main() {
 		ClientID: *clientIDPtr,
 	}
 
-	// Connect. 
-	conn, err := eftl.Connect("wss://localhost:9191/channel", opts, errChan)
+	// Connect.
+	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
 	if err != nil {
 		log.Println("connect failed:", err)
 		return

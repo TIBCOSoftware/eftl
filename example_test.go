@@ -1,14 +1,14 @@
-// Copyright © 2017. TIBCO Software Inc.
+// Copyright © 2017-2018. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
 package eftl_test
 
 import (
-	"log"
+	"fmt"
 	"time"
 
-	"tibco.com/eftl"
+	"github.com/TIBCOSoftware/eftl"
 )
 
 // Connect to the server.
@@ -23,17 +23,17 @@ func ExampleConnect() {
 	// connect to the server
 	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
 	if err != nil {
-		log.Printf("connect failed: %s", err)
+		fmt.Println("connect failed:", err)
 		return
 	}
 
 	// disconnect from the server when done with the connection
 	defer conn.Disconnect()
 
-	// listen for asynnchronous errors
+	// listen for asynnchronous connection errors
 	go func() {
 		for err := range errChan {
-			log.Printf("connection error: %s", err)
+			fmt.Println("connection error:", err)
 		}
 	}()
 }
@@ -43,7 +43,7 @@ func ExampleConnection_Reconnect() {
 	// connect to the server
 	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
 	if err != nil {
-		log.Printf("connect failed: %s", err)
+		fmt.Println("connect failed:", err)
 		return
 	}
 
@@ -56,8 +56,7 @@ func ExampleConnection_Reconnect() {
 	// reconnect to the server
 	err = conn.Reconnect()
 	if err != nil {
-		log.Printf("reconnect failed: %s", err)
-		return
+		fmt.Println("reconnect failed:", err)
 	}
 }
 
@@ -66,7 +65,7 @@ func ExampleConnection_Publish() {
 	// connect to the server
 	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
 	if err != nil {
-		log.Printf("connect failed: %s", err)
+		fmt.Println("connect failed:", err)
 		return
 	}
 
@@ -75,18 +74,17 @@ func ExampleConnection_Publish() {
 
 	// publish a message
 	err = conn.Publish(eftl.Message{
-		"_dest":        "sample",
-		"field-int":    99,
-		"field-float":  0.99,
-		"field-string": "hellow, world!",
-		"field-time":   time.Now(),
-		"field-message": eftl.Message{
-			"field-bytes": []byte("this is an embedded message"),
+		"_dest": "sample",
+		"text":  "sample text",
+		"long":  99,
+		"float": 0.99,
+		"time":  time.Now(),
+		"message": eftl.Message{
+			"bytes": []byte("this is an embedded message"),
 		},
 	})
 	if err != nil {
-		log.Printf("publish failed: %s", err)
-		return
+		fmt.Println("publish failed:", err)
 	}
 }
 
@@ -95,7 +93,7 @@ func ExampleConnection_PublishAsync() {
 	// connect to the server
 	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
 	if err != nil {
-		log.printf("connect failed: %s", err)
+		fmt.Println("connect failed:", err)
 		return
 	}
 
@@ -106,17 +104,17 @@ func ExampleConnection_PublishAsync() {
 
 	// publish a message
 	err = conn.PublishAsync(eftl.Message{
-		"_dest":        "sample",
-		"field-int":    99,
-		"field-float":  0.99,
-		"field-string": "hellow, world!",
-		"field-time":   time.Now(),
-		"field-message": eftl.Message{
-			"field-bytes": []byte("this is an embedded message"),
+		"_dest": "sample",
+		"text":  "sample text",
+		"long":  99,
+		"float": 0.99,
+		"time":  time.Now(),
+		"message": eftl.Message{
+			"bytes": []byte("this is an embedded message"),
 		},
 	}, compChan)
 	if err != nil {
-		log.printf("publish failed: %s", err)
+		fmt.Println("publish failed:", err)
 		return
 	}
 
@@ -124,9 +122,9 @@ func ExampleConnection_PublishAsync() {
 	comp := <-compChan
 
 	if comp.Error != nil {
-		log.Printf("publish completion failed: %s", err)
+		fmt.Println("publish completion failed:", err)
 	} else {
-		log.Printf("published message: %s", comp.Message)
+		fmt.Println("published message:", comp.Message)
 	}
 }
 
@@ -137,7 +135,7 @@ func ExampleConnection_Subscribe() {
 	// connect to the server
 	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, errChan)
 	if err != nil {
-		log.Printf("connect failed: %s", err)
+		fmt.Println("connect failed:", err)
 		return
 	}
 
@@ -149,17 +147,20 @@ func ExampleConnection_Subscribe() {
 	// subscribe to messages
 	sub, err := conn.Subscribe("{\"_dest\": \"sample\"}", "", msgChan)
 	if err != nil {
-		log.Printf("subscribe failed: %s", err)
+		fmt.Println("subscribe failed:", err)
 		return
 	}
+
+	// unsubscribe when done
+	conn.Unsubscribe(sub)
 
 	// receive messages
 	for {
 		select {
 		case msg := <-msgChan:
-			log.Println(msg)
+			fmt.Println(msg)
 		case err := <-errChan:
-			log.Printf("connection error: %s", err)
+			fmt.Println("connection error:", err)
 			return
 		}
 	}
@@ -172,7 +173,7 @@ func ExampleConnection_SubscribeAsync() {
 	// connect to the server
 	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, errChan)
 	if err != nil {
-		log.Printf("connect failed: %s", err)
+		fmt.Println("connect failed:", err)
 		return
 	}
 
@@ -183,9 +184,9 @@ func ExampleConnection_SubscribeAsync() {
 	msgChan := make(chan eftl.Message)
 
 	// subscribe to messages
-	err := conn.SubscribeAsync("{\"_dest\": \"sample\"}", "", msgChan, subChan)
+	err = conn.SubscribeAsync("{\"_dest\": \"sample\"}", "", msgChan, subChan)
 	if err != nil {
-		log.Printf("subscribe failed: %s", err)
+		fmt.Println("subscribe failed:", err)
 		return
 	}
 
@@ -194,14 +195,15 @@ func ExampleConnection_SubscribeAsync() {
 		select {
 		case sub := <-subChan:
 			if sub.Error != nil {
-				log.Printf("subscription failed: %s", sub.Error)
+				fmt.Println("subscription failed:", sub.Error)
 				return
 			}
-			log.Println("subscription succeeded")
+			// unsubscribe when done
+			defer conn.Unsubscribe(sub)
 		case msg := <-msgChan:
-			log.Println(msg)
+			fmt.Println(msg)
 		case err := <-errChan:
-			log.Printf("connection error: %s", err)
+			fmt.Println("connection error:", err)
 			return
 		}
 	}
