@@ -6,7 +6,6 @@ package eftl_test
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/TIBCOSoftware/eftl"
 )
@@ -75,13 +74,7 @@ func ExampleConnection_Publish() {
 	// publish a message
 	err = conn.Publish(eftl.Message{
 		"_dest": "sample",
-		"text":  "sample text",
-		"long":  99,
-		"float": 0.99,
-		"time":  time.Now(),
-		"message": eftl.Message{
-			"bytes": []byte("this is an embedded message"),
-		},
+		"text":  "Hello, World!",
 	})
 	if err != nil {
 		fmt.Println("publish failed:", err)
@@ -105,13 +98,7 @@ func ExampleConnection_PublishAsync() {
 	// publish a message
 	err = conn.PublishAsync(eftl.Message{
 		"_dest": "sample",
-		"text":  "sample text",
-		"long":  99,
-		"float": 0.99,
-		"time":  time.Now(),
-		"message": eftl.Message{
-			"bytes": []byte("this is an embedded message"),
-		},
+		"text":  "Hello, World!",
 	}, compChan)
 	if err != nil {
 		fmt.Println("publish failed:", err)
