@@ -66,13 +66,12 @@ type Options struct {
 
 	// AutoReconnectAttempts specifies the number of times the client attempts to
 	// automatically reconnect to the server following a loss of connection.
-	// The default is 5.
 	AutoReconnectAttempts int64
 
 	// AutoReconnectMaxDelay determines the maximum delay between autoreconnect attempts.
 	// Upon loss of a connection, the client will delay for 1 second before attempting to
 	// automatically reconnect. Subsequent attempts double the delay duration, up to
-	// the maximum value specified. The default is 30 seconds.
+	// the maximum value specified.
 	AutoReconnectMaxDelay time.Duration
 }
 
@@ -86,6 +85,7 @@ type Connection struct {
 	mu                sync.Mutex
 	ws                *websocket.Conn
 	connected         bool
+	timeout           time.Duration
 	pubs              []*Completion
 	pubSeqNum         int64
 	subs              map[string]*Subscription
@@ -510,11 +510,8 @@ func (conn *Connection) connect() error {
 		conn.ws.Close()
 		return err
 	}
-	// set a read deadline
-	conn.ws.SetReadDeadline(time.Now().Add(conn.Options.Timeout))
-	defer conn.ws.SetReadDeadline(time.Time{})
 	// receive welcome message
-	msg, err = conn.nextMessage()
+	msg, err = conn.nextMessage(conn.Options.Timeout)
 	if err != nil {
 		conn.ws.Close()
 		return err
@@ -531,6 +528,10 @@ func (conn *Connection) connect() error {
 	// token id
 	if val, ok := msg["id_token"].(string); ok {
 		conn.reconnectID = val
+	}
+	// timeout
+	if val, ok := msg["timeout"].(int64); ok {
+		conn.timeout = time.Duration(val) * time.Second
 	}
 	// resume
 	resume := false
@@ -574,7 +575,7 @@ func (conn *Connection) dispatch() {
 	defer conn.wg.Done()
 	for {
 		// read the next message
-		msg, err := conn.nextMessage()
+		msg, err := conn.nextMessage(conn.timeout)
 		if err != nil {
 			// only unexpected errors will trigger a reconnect
 			if _, ok := err.(*eftlError); ok {
@@ -740,7 +741,14 @@ func (conn *Connection) sendMessage(msg Message) error {
 	return conn.ws.WriteJSON(msg)
 }
 
-func (conn *Connection) nextMessage() (msg Message, err error) {
+func (conn *Connection) nextMessage(timeout time.Duration) (msg Message, err error) {
+	// set the read deadline for non-zero timeouts
+	if timeout > 0 {
+		conn.ws.SetReadDeadline(time.Now().Add(timeout))
+	} else {
+		conn.ws.SetReadDeadline(time.Time{})
+	}
+	// read the next message
 	msg = make(Message)
 	err = conn.ws.ReadJSON(&msg)
 	// translate a websocket.CloseError
