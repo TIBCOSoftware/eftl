@@ -7,6 +7,7 @@ package main
 import (
 	"flag"
 	"log"
+	"time"
 
 	"github.com/TIBCOSoftware/eftl"
 )
@@ -29,6 +30,9 @@ func main() {
 		Username: "user",
 		Password: "pass",
 		ClientID: *clientIDPtr,
+		// optional auto-reconnect options
+		AutoReconnectAttempts: 5,
+		AutoReconnectMaxDelay: 30 * time.Second,
 	}
 
 	// Connect.

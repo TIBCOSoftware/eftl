@@ -7,7 +7,6 @@ package eftl
 import (
 	"crypto/tls"
 	"fmt"
-	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -577,8 +576,9 @@ func (conn *Connection) dispatch() {
 		// read the next message
 		msg, err := conn.nextMessage(conn.timeout)
 		if err != nil {
-			// only unexpected errors will trigger a reconnect
-			if _, ok := err.(*eftlError); ok {
+			// do not attempt a reconnect if the server
+			// forcibly disconnected the client
+			if err == ErrForceClose {
 				conn.handleDisconnect(err)
 			} else {
 				conn.handleReconnect(err)
@@ -637,7 +637,10 @@ func (conn *Connection) handleDisconnect(err error) {
 			conn.pubs[i] = nil
 			comp.Error = err
 			if comp.completionChan != nil {
-				comp.completionChan <- comp
+				select {
+				case comp.completionChan <- comp:
+				default:
+				}
 			}
 		}
 		conn.pubs = conn.pubs[:0]
@@ -682,7 +685,10 @@ func (conn *Connection) handleSubscribed(msg Message) {
 	if sid, ok := msg["id"].(string); ok {
 		if sub, ok := conn.subs[sid]; ok {
 			if sub.subscriptionChan != nil {
-				sub.subscriptionChan <- sub
+				select {
+				case sub.subscriptionChan <- sub:
+				default:
+				}
 			}
 		}
 	}
@@ -702,7 +708,10 @@ func (conn *Connection) handleUnsubscribed(msg Message) {
 			}
 			delete(conn.subs, sid)
 			if sub.subscriptionChan != nil {
-				sub.subscriptionChan <- sub
+				select {
+				case sub.subscriptionChan <- sub:
+				default:
+				}
 			}
 		}
 	}
@@ -726,7 +735,10 @@ func (conn *Connection) handleAck(msg Message) {
 			if comp.seqNum <= seq {
 				comp.Error = err
 				if comp.completionChan != nil {
-					comp.completionChan <- comp
+					select {
+					case comp.completionChan <- comp:
+					default:
+					}
 				}
 			} else {
 				conn.pubs[k] = comp
@@ -754,16 +766,12 @@ func (conn *Connection) nextMessage(timeout time.Duration) (msg Message, err err
 	// translate a websocket.CloseError
 	if closeErr, ok := err.(*websocket.CloseError); ok {
 		switch closeErr.Code {
-		case websocket.CloseAbnormalClosure:
-			err = io.ErrUnexpectedEOF
 		case websocket.CloseMessageTooBig:
 			err = ErrMessageTooBig
 		case 4000:
 			err = ErrForceClose
 		case 4002:
 			err = ErrNotAuthenticated
-		default:
-			err = &eftlError{msg: closeErr.Error()}
 		}
 	}
 	return

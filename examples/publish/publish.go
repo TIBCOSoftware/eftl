@@ -23,6 +23,9 @@ func main() {
 	opts := &eftl.Options{
 		Username: "user",
 		Password: "pass",
+		// optional auto-reconnect options
+		AutoReconnectAttempts: 5,
+		AutoReconnectMaxDelay: 30 * time.Second,
 	}
 
 	// Connect.
