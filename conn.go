@@ -168,7 +168,7 @@ const (
 // defaults
 const (
 	defaultHandshakeTimeout = 10 * time.Second
-	defaultTimeout          = 2 * time.Second
+	defaultTimeout          = 10 * time.Second
 )
 
 // Connect establishes a connection to the server at the specified url.
