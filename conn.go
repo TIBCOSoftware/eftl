@@ -580,8 +580,8 @@ func (conn *Connection) dispatch() {
 			// forcibly disconnected the client
 			if err == ErrForceClose {
 				conn.handleDisconnect(err)
-			} else {
-				conn.handleReconnect(err)
+			} else if !conn.handleReconnect(err) {
+				conn.handleDisconnect(err)
 			}
 			break
 		}
@@ -604,8 +604,10 @@ func (conn *Connection) dispatch() {
 	}
 }
 
-func (conn *Connection) handleReconnect(err error) {
-	if conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+func (conn *Connection) handleReconnect(err error) bool {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if conn.connected && conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
 		// exponential backoff truncated to max delay
 		dur := time.Duration(math.Pow(2.0, float64(conn.reconnectAttempts))) * time.Second
 		if dur > conn.Options.AutoReconnectMaxDelay {
@@ -617,8 +619,9 @@ func (conn *Connection) handleReconnect(err error) {
 				conn.handleReconnect(err)
 			}
 		})
+		return true
 	} else {
-		conn.handleDisconnect(err)
+		return false
 	}
 }
 
