@@ -28,6 +28,7 @@ var (
 	ErrTimeout          = &eftlError{msg: "operation timed out"}
 	ErrNotConnected     = &eftlError{msg: "not connected"}
 	ErrInvalidResponse  = &eftlError{msg: "received invalid response from server"}
+	ErrGoingAway        = &eftlError{msg: "server going away"}
 	ErrMessageTooBig    = &eftlError{msg: "message too big"}
 	ErrNotAuthenticated = &eftlError{msg: "not authenticated"}
 	ErrForceClose       = &eftlError{msg: "server has forcibly closed the connection"}
@@ -56,7 +57,7 @@ type Options struct {
 	TLSConfig *tls.Config
 
 	// Timeout specifies the duration for a synchronous operation with the
-	// server to complete. The default is 2 seconds.
+	// server to complete. The default is 10 seconds.
 	Timeout time.Duration
 
 	// HandshakeTimeout specifies the duration for the websocket handshake
@@ -576,12 +577,12 @@ func (conn *Connection) dispatch() {
 		// read the next message
 		msg, err := conn.nextMessage(conn.timeout)
 		if err != nil {
-			// do not attempt a reconnect if the server
-			// forcibly disconnected the client
+			// if a websocket close code is received from the
+			// server only reconnect if the code is a server restart
 			if err == ErrForceClose {
 				conn.handleDisconnect(err)
-			} else if !conn.handleReconnect(err) {
-				conn.handleDisconnect(err)
+			} else {
+				conn.handleReconnect(err)
 			}
 			break
 		}
@@ -604,9 +605,8 @@ func (conn *Connection) dispatch() {
 	}
 }
 
-func (conn *Connection) handleReconnect(err error) bool {
+func (conn *Connection) handleReconnect(err error) {
 	conn.mu.Lock()
-	defer conn.mu.Unlock()
 	if conn.connected && conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
 		// exponential backoff truncated to max delay
 		dur := time.Duration(math.Pow(2.0, float64(conn.reconnectAttempts))) * time.Second
@@ -619,9 +619,10 @@ func (conn *Connection) handleReconnect(err error) bool {
 				conn.handleReconnect(err)
 			}
 		})
-		return true
+		conn.mu.Unlock()
 	} else {
-		return false
+		conn.mu.Unlock()
+		conn.handleDisconnect(err)
 	}
 }
 
@@ -769,6 +770,8 @@ func (conn *Connection) nextMessage(timeout time.Duration) (msg Message, err err
 	// translate a websocket.CloseError
 	if closeErr, ok := err.(*websocket.CloseError); ok {
 		switch closeErr.Code {
+		case websocket.CloseGoingAway:
+			err = ErrGoingAway
 		case websocket.CloseMessageTooBig:
 			err = ErrMessageTooBig
 		case 4000:
