@@ -1,4 +1,4 @@
-// Copyright © 2017-2019. TIBCO Software Inc.
+// Copyright © 2017-2020. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -8,9 +8,29 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 )
+
+// Message field name identifying the EMS destination of a message.
+//
+// The destination message field is only required when communicating with
+// EMS.
+//
+// To publish a message on a specific EMS destination include this
+// message field name in the published message.
+//  conn.Publish(eftl.Message{eftl.FieldNameDestination: "MyDest", "text": "hello"})
+//
+// To subscribe to messages published on a specific EMS destination
+// use a subscription matcher that includes this message field name.
+//  conn.Subscribe("{\"" + eftl.FieldNameDestination + "\": \"MyDest\"}", "", msgCh)
+//
+// To distinguish between topics and queues the destination name
+// can be prefixed with either "TOPIC:" or "QUEUE:", for example
+// "TOPIC:MyDest" or "QUEUE:MyDest". A destination name with no prefix
+// is a topic.
+const FieldNameDestination = "_dest"
 
 // Message represents application messages that map field names to values.
 type Message map[string]interface{}
@@ -63,11 +83,19 @@ func (msg Message) encode() (map[string]interface{}, error) {
 			}
 			m[k] = s
 		case float64:
-			m[k] = map[string]float64{"_d_": v}
+			if math.IsNaN(v) || math.IsInf(v, 0) {
+				m[k] = map[string]string{"_d_": fmt.Sprint(v)}
+			} else {
+				m[k] = map[string]float64{"_d_": v}
+			}
 		case []float64:
-			s := make([]map[string]float64, 0, len(v))
+			s := make([]interface{}, 0, len(v))
 			for _, t := range v {
-				s = append(s, map[string]float64{"_d_": t})
+				if math.IsNaN(t) || math.IsInf(t, 0) {
+					s = append(s, map[string]string{"_d_": fmt.Sprint(t)})
+				} else {
+					s = append(s, map[string]float64{"_d_": t})
+				}
 			}
 			m[k] = s
 		case time.Time:
@@ -110,6 +138,14 @@ func (msg Message) encode() (map[string]interface{}, error) {
 				s = append(s, enc)
 			}
 			m[k] = s
+		case bool:
+			if v {
+				m[k] = 1
+			} else {
+				m[k] = 0
+			}
+		case nil:
+			// skip
 		}
 	}
 	return m, nil

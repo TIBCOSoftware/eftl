@@ -1,4 +1,4 @@
-// Copyright © 2017-2019. TIBCO Software Inc.
+// Copyright © 2017-2020. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -7,7 +7,6 @@ package main
 import (
 	"flag"
 	"log"
-	"time"
 
 	"github.com/TIBCOSoftware/eftl"
 )
@@ -26,14 +25,10 @@ func main() {
 	errChan := make(chan error, 1)
 
 	// Set connection options.
-	opts := &eftl.Options{
-		Username: "user",
-		Password: "pass",
-		ClientID: *clientIDPtr,
-		// optional auto-reconnect options
-		AutoReconnectAttempts: 5,
-		AutoReconnectMaxDelay: 30 * time.Second,
-	}
+	opts := eftl.DefaultOptions()
+	opts.Username = "user"
+	opts.Password = "pass"
+	opts.ClientID = *clientIDPtr
 
 	// Connect.
 	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
@@ -47,8 +42,15 @@ func main() {
 
 	log.Println("connected")
 
+	// Channel on which to listen for subscription events.
+	subChan := make(chan *eftl.Subscription, 1)
+
 	// Channel on which to listen for published messages.
 	msgChan := make(chan eftl.Message, 100)
+
+	// Subscription options set for auto acknowledgments.
+	subopts := eftl.SubscriptionOptions{}
+	subopts.AcknowledgeMode = eftl.AcknowledgeModeAuto
 
 	// Subscribe to messages.
 	//
@@ -65,17 +67,17 @@ func main() {
 	// The durable name "example" is being used for this
 	// subscription.
 	//
-	sub, err := conn.Subscribe("{\"type\":\"example\"}", "example", msgChan)
-	if err != nil {
-		log.Println("subscription failed:", err)
-	}
+	conn.SubscribeWithOptionsAsync("{\"type\":\"example\"}", "example", subopts, msgChan, subChan)
 
-	// Unsubscribe when done.
-	defer conn.Unsubscribe(sub)
-
-	// Listen for messages and connection errors.
+	// Listen for subscriptions, messages, and connection errors.
 	for {
 		select {
+		case sub := <-subChan:
+			if sub.Error != nil {
+				log.Println("subscription error:", sub.Error)
+			} else {
+				log.Println("subscribed with matcher", sub.Matcher)
+			}
 		case msg := <-msgChan:
 			log.Println("received message:", msg)
 		case err := <-errChan:

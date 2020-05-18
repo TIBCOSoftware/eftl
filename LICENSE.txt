@@ -1,4 +1,4 @@
-TIBCO Samples Internal End User License Copyright (c) 2019, TIBCO Software Inc.
+TIBCO Samples Internal End User License Copyright (c) 2020, TIBCO Software Inc.
 All rights reserved.
 
 By downloading or using this software, you agree to the license below and the

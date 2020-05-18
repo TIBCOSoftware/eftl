@@ -1,4 +1,4 @@
-// Copyright © 2017-2019. TIBCO Software Inc.
+// Copyright © 2017-2020. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -8,9 +8,12 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,18 +26,21 @@ type eftlError struct {
 
 func (e *eftlError) Error() string { return e.msg }
 
+type requests map[int64]*Completion
+
 // Errors
 var (
 	ErrTimeout          = &eftlError{msg: "operation timed out"}
 	ErrNotConnected     = &eftlError{msg: "not connected"}
 	ErrInvalidResponse  = &eftlError{msg: "received invalid response from server"}
-	ErrGoingAway        = &eftlError{msg: "server going away"}
 	ErrMessageTooBig    = &eftlError{msg: "message too big"}
 	ErrNotAuthenticated = &eftlError{msg: "not authenticated"}
 	ErrForceClose       = &eftlError{msg: "server has forcibly closed the connection"}
 	ErrNotAuthorized    = &eftlError{msg: "not authorized for the operation"}
 	ErrBadHandshake     = &eftlError{msg: "bad handshake"}
 	ErrNotFound         = &eftlError{msg: "not found"}
+	ErrRestart          = &eftlError{msg: "server restart"}
+	ErrReconnect        = &eftlError{msg: "reconnect"}
 )
 
 // Options available to configure the connection.
@@ -66,13 +72,24 @@ type Options struct {
 
 	// AutoReconnectAttempts specifies the number of times the client attempts to
 	// automatically reconnect to the server following a loss of connection.
+	// The default is 5 attempts.
 	AutoReconnectAttempts int64
 
 	// AutoReconnectMaxDelay determines the maximum delay between autoreconnect attempts.
 	// Upon loss of a connection, the client will delay for 1 second before attempting to
 	// automatically reconnect. Subsequent attempts double the delay duration, up to
-	// the maximum value specified.
+	// the maximum value specified. The default is 30 seconds.
 	AutoReconnectMaxDelay time.Duration
+}
+
+// DefaultOptions returns the default connection options.
+func DefaultOptions() *Options {
+	return &Options{
+		Timeout:               DefaultTimeout,
+		HandshakeTimeout:      DefaultHandshakeTimeout,
+		AutoReconnectAttempts: DefaultReconnectAttempts,
+		AutoReconnectMaxDelay: DefaultReconnectMaxDelay,
+	}
 }
 
 // Connection represents a connection to the server.
@@ -84,20 +101,44 @@ type Connection struct {
 	wg                sync.WaitGroup
 	mu                sync.Mutex
 	ws                *websocket.Conn
+	urlList           []*url.URL
+	urlIndex          int
 	connected         bool
 	timeout           time.Duration
-	pubs              []*Completion
-	pubSeqNum         int64
+	reqs              requests
+	reqSeqNum         int64
 	subs              map[string]*Subscription
 	subSeqNum         int64
-	lastSeqNum        int64
 	reconnectAttempts int64
 	reconnectTimer    *time.Timer
 }
 
+type AcknowledgeMode string
+
+const (
+	AcknowledgeModeAuto   AcknowledgeMode = "auto"
+	AcknowledgeModeClient                 = "client"
+	AcknowledgeModeNone                   = "none"
+)
+
+const (
+	DurableTypeShared    string = "shared"
+	DurableTypeLastValue        = "last-value"
+)
+
 // Options available to configure a subscription.
 type SubscriptionOptions struct {
-	// Durable subscription type; "shared" or "last-value".
+	// Message acknowledgment mode; "auto", "client", or "none".
+	//
+	// The default message acknowledgement mode is "auto".
+	//
+	// Messages consumed from a subscription with an acknowledgment mode
+	// of "client" require explicit acknowledgment by the client. The eFTL
+	// server will stop delivering messages to the client once the
+	// server's configured maximum unacknowledged messages is reached.
+	AcknowledgeMode AcknowledgeMode
+
+	// Optional durable subscription type; "shared" or "last-value".
 	DurableType string
 
 	// Key field for "last-value" durable subscriptions.
@@ -113,8 +154,14 @@ type Subscription struct {
 	Options          SubscriptionOptions
 	MessageChan      chan Message
 	Error            error
+	lastSeqNum       int64
 	subscriptionID   string
 	subscriptionChan chan *Subscription
+}
+
+func (sub *Subscription) autoAck() bool {
+	return sub.Options.AcknowledgeMode == "" ||
+		sub.Options.AcknowledgeMode == AcknowledgeModeAuto
 }
 
 func (sub *Subscription) toProtocol() Message {
@@ -128,8 +175,11 @@ func (sub *Subscription) toProtocol() Message {
 	if sub.Durable != "" {
 		msg["durable"] = sub.Durable
 	}
+	if sub.Options.AcknowledgeMode != "" {
+		msg["ack"] = string(sub.Options.AcknowledgeMode)
+	}
 	if sub.Options.DurableType != "" {
-		msg["type"] = sub.Options.DurableType
+		msg["type"] = string(sub.Options.DurableType)
 	}
 	if sub.Options.DurableKey != "" {
 		msg["key"] = sub.Options.DurableKey
@@ -137,13 +187,14 @@ func (sub *Subscription) toProtocol() Message {
 	return msg
 }
 
-// Completion represents a completed publish operation. When returned
-// from an asynchronous publish operation a non-nil Error indicates
-// a publish failure.
+// Completion represents a completed operation. When returned
+// from an asynchronous operation a non-nil Error indicates
+// a failure.
 type Completion struct {
 	Message        Message
 	Error          error
 	seqNum         int64
+	request        Message
 	completionChan chan *Completion
 }
 
@@ -164,15 +215,26 @@ const (
 	opAck          = 9
 	opError        = 10
 	opDisconnect   = 11
+	opMapCreate    = 16
+	opMapDestroy   = 18
+	opMapSet       = 20
+	opMapGet       = 22
+	opMapRemove    = 24
+	opMapResponse  = 26
 )
 
-// defaults
+// Default constants.
 const (
-	defaultHandshakeTimeout = 10 * time.Second
-	defaultTimeout          = 10 * time.Second
+	DefaultTimeout           = 10 * time.Second
+	DefaultHandshakeTimeout  = 10 * time.Second
+	DefaultReconnectAttempts = 5
+	DefaultReconnectMaxDelay = 30 * time.Second
 )
 
 // Connect establishes a connection to the server at the specified url.
+//
+// When a pipe-separated list of URLs is specified this call will attempt
+// a connection to each in turn, in a random order, until one is connected.
 //
 // The url can be in either of these forms:
 //   ws://host:port/channel
@@ -189,33 +251,34 @@ const (
 // once the connection has been established.
 func Connect(urlStr string, opts *Options, errorChan chan error) (*Connection, error) {
 	if opts == nil {
-		opts = &Options{}
+		opts = DefaultOptions()
 	}
-	url, err := url.Parse(urlStr)
+	urlList, err := parseURLString(urlStr)
 	if err != nil {
 		return nil, err
 	}
 	// initialize the connection
 	conn := &Connection{
-		URL:       url,
 		Options:   *opts,
 		ErrorChan: errorChan,
-		pubs:      make([]*Completion, 0),
+		reqs:      make(requests),
 		subs:      make(map[string]*Subscription),
+		urlList:   urlList,
 	}
 	// set default values
-	if conn.Options.HandshakeTimeout == 0 {
-		conn.Options.HandshakeTimeout = defaultHandshakeTimeout
-	}
 	if conn.Options.Timeout == 0 {
-		conn.Options.Timeout = defaultTimeout
+		conn.Options.Timeout = DefaultTimeout
+	}
+	if conn.Options.HandshakeTimeout == 0 {
+		conn.Options.HandshakeTimeout = DefaultHandshakeTimeout
 	}
 	// connect to the server
-	err = conn.connect()
-	if err != nil {
-		return nil, err
+	for _, url := range conn.urlList {
+		if err = conn.connect(url); err == nil {
+			return conn, nil // success
+		}
 	}
-	return conn, nil
+	return nil, err
 }
 
 // Reconnect re-establishes the connection to the server following a
@@ -228,8 +291,14 @@ func (conn *Connection) Reconnect() error {
 	if conn.connected {
 		return nil
 	}
+	var err error
 	// connect to the server
-	return conn.connect()
+	for _, url := range conn.urlList {
+		if err = conn.connect(url); err == nil {
+			return nil // success
+		}
+	}
+	return err
 }
 
 // Disconnect closes the connection to the server.
@@ -262,15 +331,6 @@ func (conn *Connection) IsConnected() bool {
 }
 
 // Publish an application message.
-//
-// It is recommended to publish messages to a specific destination
-// by including the string field "_dest":
-//
-//     conn.Publish(Message{
-//         "_dest": "sample",
-//         "text": "Hello, World!",
-//     })
-//
 func (conn *Connection) Publish(msg Message) error {
 	completionChan := make(chan *Completion, 1)
 	if err := conn.PublishAsync(msg, completionChan); err != nil {
@@ -287,15 +347,6 @@ func (conn *Connection) Publish(msg Message) error {
 // Publish an application message asynchronously. The optional
 // completionChan will receive notification once the publish
 // operation completes.
-//
-// It is recommended to publish messages to a specific destination
-// by including the string field "_dest":
-//
-//     conn.Publish(Message{
-//         "_dest": "sample",
-//         "text": "Hello, World!",
-//     })
-//
 func (conn *Connection) PublishAsync(msg Message, completionChan chan *Completion) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -303,30 +354,26 @@ func (conn *Connection) PublishAsync(msg Message, completionChan chan *Completio
 		return ErrNotConnected
 	}
 	// register the publish
-	conn.pubSeqNum++
-	conn.pubs = append(conn.pubs, &Completion{
-		Message:        msg,
-		seqNum:         conn.pubSeqNum,
+	conn.reqSeqNum++
+	conn.reqs[conn.reqSeqNum] = &Completion{
+		Message: msg,
+		request: Message{
+			"op":   opPublish,
+			"seq":  conn.reqSeqNum,
+			"body": msg,
+		},
+		seqNum:         conn.reqSeqNum,
 		completionChan: completionChan,
-	})
+	}
 	// send publish message
-	return conn.sendMessage(Message{
-		"op":   opPublish,
-		"seq":  conn.pubSeqNum,
-		"body": msg,
-	})
+	conn.sendMessage(conn.reqs[conn.reqSeqNum].request)
+	return nil
 }
 
 // Subscribe registers interest in application messages.
 // A content matcher can be used to register interest in certain messages.
 // A durable name can be specified to create a durable subscription.
 // Messages are received on the messageChan.
-//
-// It is recommended to subscribe to messages published to a specific
-// destination by creating a content matcher with the string field "_dest":
-//
-//     conn.Subscribe("{\"_dest\": \"sample\"}", "", messageChan)
-//
 func (conn *Connection) Subscribe(matcher string, durable string, messageChan chan Message) (*Subscription, error) {
 	subscriptionChan := make(chan *Subscription, 1)
 	if err := conn.SubscribeAsync(matcher, durable, messageChan, subscriptionChan); err != nil {
@@ -345,12 +392,6 @@ func (conn *Connection) Subscribe(matcher string, durable string, messageChan ch
 // A durable name can be specified to create a durable subscription.
 // Messages are received on the messageChan. The subscriptionChan
 // will receive notification once the subscribe operation completes.
-//
-// It is recommended to subscribe to messages published to a specific
-// destination by creating a content matcher with the string field "_dest":
-//
-//     conn.Subscribe("{\"_dest\": \"sample\"}", "", messageChan)
-//
 func (conn *Connection) SubscribeAsync(matcher string, durable string, messageChan chan Message, subscriptionChan chan *Subscription) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -369,7 +410,8 @@ func (conn *Connection) SubscribeAsync(matcher string, durable string, messageCh
 	}
 	conn.subs[sid] = sub
 	// send subscribe protocol
-	return conn.sendMessage(sub.toProtocol())
+	conn.sendMessage(sub.toProtocol())
+	return nil
 }
 
 // Subscribe registers interest in application messages.
@@ -415,7 +457,8 @@ func (conn *Connection) SubscribeWithOptionsAsync(matcher string, durable string
 	}
 	conn.subs[sid] = sub
 	// send subscribe protocol
-	return conn.sendMessage(sub.toProtocol())
+	conn.sendMessage(sub.toProtocol())
+	return nil
 }
 
 // Unsubscribe unregisters the subscription.
@@ -454,7 +497,50 @@ func (conn *Connection) UnsubscribeAll() error {
 	return nil
 }
 
-func (conn *Connection) connect() error {
+// Acknowledge this message.
+func (conn *Connection) Acknowledge(msg Message) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.connected {
+		return ErrNotConnected
+	}
+	seq, ok := msg["_eftl:sequenceNumber"].(int64)
+	if !ok {
+		return nil
+	}
+	// send acknowledge protocol
+	conn.sendMessage(Message{
+		"op":  opAck,
+		"seq": seq,
+	})
+	return nil
+}
+
+// Acknowledge all messages up to and including this message.
+func (conn *Connection) AcknowledgeAll(msg Message) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.connected {
+		return ErrNotConnected
+	}
+	seq, ok := msg["_eftl:sequenceNumber"].(int64)
+	if !ok {
+		return nil
+	}
+	sid, ok := msg["_eftl:subscriptionId"].(string)
+	if !ok {
+		return nil
+	}
+	// send acknowledge protocol
+	conn.sendMessage(Message{
+		"op":  opAck,
+		"seq": seq,
+		"id":  sid,
+	})
+	return nil
+}
+
+func (conn *Connection) connect(uri *url.URL) error {
 	// create websocket connection
 	d := &websocket.Dialer{
 		HandshakeTimeout: conn.Options.HandshakeTimeout,
@@ -462,9 +548,9 @@ func (conn *Connection) connect() error {
 		TLSClientConfig:  conn.Options.TLSConfig,
 	}
 	u := &url.URL{
-		Scheme: conn.URL.Scheme,
-		Host:   conn.URL.Host,
-		Path:   conn.URL.Path,
+		Scheme: uri.Scheme,
+		Host:   uri.Host,
+		Path:   uri.Path,
 	}
 	ws, resp, err := d.Dial(u.String(), nil)
 	if err == websocket.ErrBadHandshake {
@@ -487,18 +573,18 @@ func (conn *Connection) connect() error {
 			"_resume": "true",
 		},
 	}
-	if conn.URL.User != nil {
-		msg["user"] = conn.URL.User.Username()
+	if uri.User != nil {
+		msg["user"] = uri.User.Username()
 	} else if conn.Options.Username != "" {
 		msg["user"] = conn.Options.Username
 	}
-	if conn.URL.User != nil {
-		msg["password"], _ = conn.URL.User.Password()
+	if uri.User != nil {
+		msg["password"], _ = uri.User.Password()
 	} else if conn.Options.Password != "" {
 		msg["password"] = conn.Options.Password
 	}
-	if conn.URL.Query().Get("clientId") != "" {
-		msg["client_id"] = conn.URL.Query().Get("clientId")
+	if uri.Query().Get("clientId") != "" {
+		msg["client_id"] = uri.Query().Get("clientId")
 	} else if conn.Options.ClientID != "" {
 		msg["client_id"] = conn.Options.ClientID
 	}
@@ -548,15 +634,26 @@ func (conn *Connection) connect() error {
 	}
 	if resume {
 		// re-send unacknowledged messages
-		for _, comp := range conn.pubs {
-			conn.sendMessage(Message{
-				"op":   opPublish,
-				"seq":  comp.seqNum,
-				"body": comp.Message,
-			})
-		}
+		conn.reqs.iterate(func(comp *Completion) {
+			conn.sendMessage(comp.request)
+		})
 	} else {
-		conn.lastSeqNum = 0
+		// notify unacknowledged messages
+		conn.reqs.iterate(func(comp *Completion) {
+			comp.Error = ErrReconnect
+			if comp.completionChan != nil {
+				select {
+				case comp.completionChan <- comp:
+				default:
+				}
+			}
+		})
+		conn.reqs = make(requests)
+
+		// reset subscription last sequence number
+		for _, sub := range conn.subs {
+			sub.lastSeqNum = 0
+		}
 	}
 	// process incoming messages
 	conn.wg.Add(1)
@@ -577,9 +674,8 @@ func (conn *Connection) dispatch() {
 		// read the next message
 		msg, err := conn.nextMessage(conn.timeout)
 		if err != nil {
-			// if a websocket close code is received from the
-			// server only reconnect if the code is a server restart
-			if err == ErrForceClose {
+			// reconnect when the close code reflects a server shutdown
+			if e, ok := err.(*eftlError); ok && e != ErrRestart {
 				conn.handleDisconnect(err)
 			} else {
 				conn.handleReconnect(err)
@@ -600,28 +696,33 @@ func (conn *Connection) dispatch() {
 			case opAck:
 				conn.handleAck(msg)
 			case opError:
+				conn.handleError(msg)
+			case opMapResponse:
+				conn.handleMapResponse(msg)
 			}
 		}
 	}
 }
 
 func (conn *Connection) handleReconnect(err error) {
-	conn.mu.Lock()
-	if conn.connected && conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+	if conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+		// add jitter by applying a randomness factor of 0.5
+		jitter := rand.Float64() + 0.5
 		// exponential backoff truncated to max delay
-		dur := time.Duration(math.Pow(2.0, float64(conn.reconnectAttempts))) * time.Second
+		dur := time.Duration(math.Pow(2.0, float64(conn.reconnectAttempts))*jitter) * time.Second
 		if dur > conn.Options.AutoReconnectMaxDelay {
 			dur = conn.Options.AutoReconnectMaxDelay
 		}
 		conn.reconnectAttempts++
 		conn.reconnectTimer = time.AfterFunc(dur, func() {
-			if e := conn.connect(); e != nil {
-				conn.handleReconnect(err)
+			for _, url := range conn.urlList {
+				if e := conn.connect(url); e == nil {
+					return
+				}
 			}
+			conn.handleReconnect(err)
 		})
-		conn.mu.Unlock()
 	} else {
-		conn.mu.Unlock()
 		conn.handleDisconnect(err)
 	}
 }
@@ -636,9 +737,7 @@ func (conn *Connection) handleDisconnect(err error) {
 			conn.ErrorChan <- err
 		}
 		// clear pending completions
-		for i := 0; i < len(conn.pubs); i++ {
-			comp := conn.pubs[i]
-			conn.pubs[i] = nil
+		conn.reqs.iterate(func(comp *Completion) {
 			comp.Error = err
 			if comp.completionChan != nil {
 				select {
@@ -646,8 +745,8 @@ func (conn *Connection) handleDisconnect(err error) {
 				default:
 				}
 			}
-		}
-		conn.pubs = conn.pubs[:0]
+		})
+		conn.reqs = make(requests)
 	}
 }
 
@@ -662,24 +761,28 @@ func (conn *Connection) handleMessage(msg Message) {
 	defer conn.mu.Unlock()
 	seq, _ := msg["seq"].(int64)
 	body, _ := msg["body"].(Message)
-	if sid, ok := msg["to"].(string); ok {
-		if seq == 0 || seq > conn.lastSeqNum {
-			if sub, ok := conn.subs[sid]; ok {
-				if sub.MessageChan != nil {
-					sub.MessageChan <- body
-				}
+	sid, _ := msg["to"].(string)
+	if sub, ok := conn.subs[sid]; ok {
+		if seq == 0 || seq > sub.lastSeqNum {
+			if !sub.autoAck() && seq != 0 {
+				body["_eftl:sequenceNumber"] = seq
+				body["_eftl:subscriptionId"] = sid
 			}
-			if seq > 0 {
-				conn.lastSeqNum = seq
+			if sub.MessageChan != nil {
+				sub.MessageChan <- body
+			}
+			if sub.autoAck() && seq != 0 {
+				sub.lastSeqNum = seq
 			}
 		}
-	}
-	if seq > 0 {
-		// acknowledge message receipt
-		conn.sendMessage(Message{
-			"op":  opAck,
-			"seq": seq,
-		})
+		if sub.autoAck() && seq != 0 {
+			// acknowledge message receipt
+			conn.sendMessage(Message{
+				"op":  opAck,
+				"seq": seq,
+				"id":  sid,
+			})
+		}
 	}
 }
 
@@ -734,22 +837,55 @@ func (conn *Connection) handleAck(msg Message) {
 				err = fmt.Errorf("%d: %s", errCode, reason)
 			}
 		}
-		k := 0
-		for _, comp := range conn.pubs {
-			if comp.seqNum <= seq {
-				comp.Error = err
-				if comp.completionChan != nil {
-					select {
-					case comp.completionChan <- comp:
-					default:
-					}
+		if comp, ok := conn.reqs[seq]; ok {
+			comp.Error = err
+			if comp.completionChan != nil {
+				select {
+				case comp.completionChan <- comp:
+				default:
 				}
+			}
+			delete(conn.reqs, seq)
+		}
+	}
+}
+
+func (conn *Connection) handleError(msg Message) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	errCode, _ := msg["err"].(int64)
+	reason, _ := msg["reason"].(string)
+	if conn.ErrorChan != nil {
+		conn.ErrorChan <- fmt.Errorf("%d: %s", errCode, reason)
+	}
+}
+
+func (conn *Connection) handleMapResponse(msg Message) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if seq, ok := msg["seq"].(int64); ok {
+		var err error
+		if errCode, ok := msg["err"].(int64); ok {
+			if errCode == 14 {
+				err = ErrNotAuthorized
 			} else {
-				conn.pubs[k] = comp
-				k++
+				reason, _ := msg["reason"].(string)
+				err = fmt.Errorf("%d: %s", errCode, reason)
 			}
 		}
-		conn.pubs = conn.pubs[:k]
+		if comp, ok := conn.reqs[seq]; ok {
+			comp.Error = err
+			if value, ok := msg["value"].(Message); ok {
+				comp.Message = value
+			}
+			if comp.completionChan != nil {
+				select {
+				case comp.completionChan <- comp:
+				default:
+				}
+			}
+			delete(conn.reqs, seq)
+		}
 	}
 }
 
@@ -770,10 +906,10 @@ func (conn *Connection) nextMessage(timeout time.Duration) (msg Message, err err
 	// translate a websocket.CloseError
 	if closeErr, ok := err.(*websocket.CloseError); ok {
 		switch closeErr.Code {
-		case websocket.CloseGoingAway:
-			err = ErrGoingAway
 		case websocket.CloseMessageTooBig:
 			err = ErrMessageTooBig
+		case websocket.CloseServiceRestart:
+			err = ErrRestart
 		case 4000:
 			err = ErrForceClose
 		case 4002:
@@ -781,4 +917,33 @@ func (conn *Connection) nextMessage(timeout time.Duration) (msg Message, err err
 		}
 	}
 	return
+}
+
+func (reqs requests) iterate(fn func(comp *Completion)) {
+	var keys []int64
+	for k := range reqs {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, k := range keys {
+		fn(reqs[k])
+	}
+}
+
+func parseURLString(urlStr string) ([]*url.URL, error) {
+	urlList := make([]*url.URL, 0)
+	for _, str := range strings.Split(urlStr, "|") {
+		url, err := url.Parse(str)
+		if err != nil {
+			return nil, err
+		}
+		urlList = append(urlList, url)
+	}
+	// shuffle the list
+	rand.Seed(time.Now().UnixNano())
+	for i := len(urlList) - 1; i > 0; i-- {
+		j := rand.Intn(i + 1)
+		urlList[i], urlList[j] = urlList[j], urlList[i]
+	}
+	return urlList, nil
 }

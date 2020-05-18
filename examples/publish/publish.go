@@ -1,4 +1,4 @@
-// Copyright © 2017-2019. TIBCO Software Inc.
+// Copyright © 2017-2020. TIBCO Software Inc.
 // This file is subject to the license terms contained
 // in the license file that is distributed with this file.
 
@@ -20,13 +20,9 @@ func main() {
 	errChan := make(chan error, 1)
 
 	// Set connection options.
-	opts := &eftl.Options{
-		Username: "user",
-		Password: "pass",
-		// optional auto-reconnect options
-		AutoReconnectAttempts: 5,
-		AutoReconnectMaxDelay: 30 * time.Second,
-	}
+	opts := eftl.DefaultOptions()
+	opts.Username = "user"
+	opts.Password = "pass"
 
 	// Connect.
 	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
