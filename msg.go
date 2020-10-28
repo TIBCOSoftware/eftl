@@ -5,12 +5,25 @@
 package eftl
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
+	"strings"
 	"time"
+)
+
+const headerPrefix = "_eftl:"
+
+const (
+	storeMessageIdHeader = headerPrefix + "storeMessageId"
+	sequenceNumberHeader = headerPrefix + "sequenceNumber"
+	subscriptionIdHeader = headerPrefix + "subscriptionId"
+	replyToHeader        = headerPrefix + "replyTo"
+	requestIdHeader      = headerPrefix + "requestId"
 )
 
 // Message field name identifying the EMS destination of a message.
@@ -32,8 +45,59 @@ import (
 // is a topic.
 const FieldNameDestination = "_dest"
 
+func (msg Message) String() string {
+	keys := make([]string, 0, len(msg))
+	for k := range msg {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	b := new(bytes.Buffer)
+	b.WriteString("{")
+	for _, k := range keys {
+		if strings.HasPrefix(k, headerPrefix) {
+			continue
+		}
+		if b.Len() > 1 {
+			b.WriteString(", ")
+		}
+		v := msg[k]
+		switch v := v.(type) {
+		default:
+			fmt.Fprintf(b, "%s=%v", k, v)
+		case string:
+			fmt.Fprintf(b, "%s=\"%s\"", k, v)
+		}
+	}
+	b.WriteString("}")
+	return b.String()
+}
+
 // Message represents application messages that map field names to values.
+//
+// To create a message, use make:
+//  msg := make(eftl.Message)
+// Setting a message field value:
+//  msg["myFieldName"] = "my field value"
+// Getting a message field value:
+//  val := msg["myFieldName"]
+// Removing a message field value:
+//  delete(msg, "myFieldName")
+// The following field types are supported:
+//  - string, []string
+//  - int64 , []int64
+//  - float64 , []float64
+//  - time.Time, []time.Time
+//  - eftl.Message, []eftl.Message
+//  - []byte
+//
+// bool and nil field values are not supported.
 type Message map[string]interface{}
+
+// Unique store identifier assigned by the persistence service.
+func (msg Message) StoreMessageId() int64 {
+	msgId, _ := msg[storeMessageIdHeader].(int64)
+	return msgId
+}
 
 // MarshalJSON encodes the message into JSON.
 func (msg Message) MarshalJSON() ([]byte, error) {
@@ -57,6 +121,9 @@ func (msg Message) UnmarshalJSON(b []byte) error {
 func (msg Message) encode() (map[string]interface{}, error) {
 	m := make(map[string]interface{})
 	for k, v := range msg {
+		if strings.HasPrefix(k, headerPrefix) {
+			continue
+		}
 		switch v := v.(type) {
 		default:
 			return nil, fmt.Errorf("unsupported type for field '%s'", k)

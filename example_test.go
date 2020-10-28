@@ -20,7 +20,7 @@ func ExampleConnect() {
 	opts.Password = "password"
 
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", opts, errChan)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -41,7 +41,7 @@ func ExampleConnect() {
 // Reconnect to the server.
 func ExampleConnection_Reconnect() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -64,7 +64,7 @@ func ExampleConnection_Reconnect() {
 // Publish messages.
 func ExampleConnection_Publish() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -92,7 +92,7 @@ func ExampleConnection_Publish() {
 // Publish messages asynchronously.
 func ExampleConnection_PublishAsync() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -136,7 +136,7 @@ func ExampleConnection_Subscribe() {
 	errChan := make(chan error)
 
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, errChan)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, errChan)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -175,7 +175,7 @@ func ExampleConnection_SubscribeAsync() {
 	errChan := make(chan error)
 
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, errChan)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, errChan)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -214,10 +214,76 @@ func ExampleConnection_SubscribeAsync() {
 	}
 }
 
+// Publish request messages and wait for a reply.
+func ExampleConnection_SendRequest() {
+	// connect to the server
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
+	if err != nil {
+		fmt.Println("connect failed:", err)
+		return
+	}
+
+	// disconnect from the server when done with the connection
+	defer conn.Disconnect()
+
+	// publish a request message and wait for a reply.
+	reply, err = conn.SendRequest(eftl.Message{
+		"type": "request",
+		"text": "this is a request message",
+	}, 10*time.Second)
+	if err == eftl.ErrTimeout {
+		fmt.Println("request failed:", timeout)
+	} else if err != nil {
+		fmt.Println("request failed:", err)
+	} else {
+		fmt.Println("received reply:", reply)
+	}
+	// Output:
+}
+
+// Publish request messages asynchronously and receive a reply.
+func ExampleConnection_SendRequestAsync() {
+	// connect to the server
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
+	if err != nil {
+		fmt.Println("connect failed:", err)
+		return
+	}
+
+	// disconnect from the server when done with the connection
+	defer conn.Disconnect()
+
+	// create a completion channel
+	compChan := make(chan *eftl.Completion, 1)
+
+	// publish a request message
+	err = conn.SendRequestAsync(eftl.Message{
+		"type": "request",
+		"text": "this is a request message",
+	}, compChan)
+	if err != nil {
+		fmt.Println("request failed:", err)
+		return
+	}
+
+	// wait for request to complete
+	select {
+	case comp := <-compChan:
+		if comp.Error != nil {
+			fmt.Println("request failed:", err)
+		} else {
+			fmt.Println("received reply:", comp.Message)
+		}
+	case <-time.After(10 * time.Second):
+		fmt.Println("request failed: timeout")
+	}
+	// Output:
+}
+
 // Set a key-value pair in a map.
 func ExampleKVMap_Set() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -239,7 +305,7 @@ func ExampleKVMap_Set() {
 // Set a key-value pair in a map asynchronously.
 func ExampleKVMap_SetAsync() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -275,7 +341,7 @@ func ExampleKVMap_SetAsync() {
 // Get a key-value pair from a map.
 func ExampleKVMap_Get() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -299,7 +365,7 @@ func ExampleKVMap_Get() {
 // Get a key-value pair from a map asynchronously.
 func ExampleKVMap_GetAsync() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -338,7 +404,7 @@ func ExampleKVMap_GetAsync() {
 // Remove a key-value pair from a map.
 func ExampleKVMap_Remove() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return
@@ -357,7 +423,7 @@ func ExampleKVMap_Remove() {
 // Remove a key-value pair from a map asynchronously.
 func ExampleKVMap_RemoveAsync() {
 	// connect to the server
-	conn, err := eftl.Connect("ws://localhost:9191/channel", nil, nil)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", nil, nil)
 	if err != nil {
 		fmt.Println("connect failed:", err)
 		return

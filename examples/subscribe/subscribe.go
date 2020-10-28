@@ -31,7 +31,7 @@ func main() {
 	opts.ClientID = *clientIDPtr
 
 	// Connect.
-	conn, err := eftl.Connect("ws://localhost:9191/channel", opts, errChan)
+	conn, err := eftl.Connect("ws://localhost:8585/channel", opts, errChan)
 	if err != nil {
 		log.Println("connect failed:", err)
 		return

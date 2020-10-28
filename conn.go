@@ -33,6 +33,7 @@ var (
 	ErrTimeout          = &eftlError{msg: "operation timed out"}
 	ErrNotConnected     = &eftlError{msg: "not connected"}
 	ErrInvalidResponse  = &eftlError{msg: "received invalid response from server"}
+	ErrGoingAway        = &eftlError{msg: "server going away"}
 	ErrMessageTooBig    = &eftlError{msg: "message too big"}
 	ErrNotAuthenticated = &eftlError{msg: "not authenticated"}
 	ErrForceClose       = &eftlError{msg: "server has forcibly closed the connection"}
@@ -41,6 +42,21 @@ var (
 	ErrNotFound         = &eftlError{msg: "not found"}
 	ErrRestart          = &eftlError{msg: "server restart"}
 	ErrReconnect        = &eftlError{msg: "reconnect"}
+	ErrNotRequest       = &eftlError{msg: "not a request message"}
+	ErrNotSupported     = &eftlError{msg: "not supported with this server"}
+)
+
+// Error codes
+const (
+	ErrCodePublishDisallowed      = 12
+	ErrCodePublishFailed          = 11
+	ErrCodeSubscriptionDisallowed = 13
+	ErrCodeSubscriptionFailed     = 21
+	ErrCodeSubscriptionInvalid    = 22
+	ErrCodeMapRequestDisallowed   = 14
+	ErrCodeMapRequestFailed       = 30
+	ErrCodeRequestDisallowed      = 40
+	ErrCodeRequestFailed          = 41
 )
 
 // Options available to configure the connection.
@@ -63,7 +79,7 @@ type Options struct {
 	TLSConfig *tls.Config
 
 	// Timeout specifies the duration for a synchronous operation with the
-	// server to complete. The default is 10 seconds.
+	// server to complete. The default is 60 seconds.
 	Timeout time.Duration
 
 	// HandshakeTimeout specifies the duration for the websocket handshake
@@ -80,6 +96,12 @@ type Options struct {
 	// automatically reconnect. Subsequent attempts double the delay duration, up to
 	// the maximum value specified. The default is 30 seconds.
 	AutoReconnectMaxDelay time.Duration
+
+	// MaxPendingAcks specifies the maximum number of unacknowledged messages
+	// allowed for the client. Once reached the client will stop receiving
+	// additional messages until previously received messages are acknowledged.
+	// If not specified the server's configured value will be used.
+	MaxPendingAcks int32
 }
 
 // DefaultOptions returns the default connection options.
@@ -97,6 +119,7 @@ type Connection struct {
 	URL               *url.URL
 	Options           Options
 	ErrorChan         chan error
+	protocol          int64
 	reconnectID       string
 	wg                sync.WaitGroup
 	mu                sync.Mutex
@@ -157,6 +180,7 @@ type Subscription struct {
 	lastSeqNum       int64
 	subscriptionID   string
 	subscriptionChan chan *Subscription
+	pending          bool
 }
 
 func (sub *Subscription) autoAck() bool {
@@ -201,6 +225,8 @@ type Completion struct {
 // subprotocol used for websocket communications.
 const subprotocol = "v1.eftl.tibco.com"
 
+const protocolVer = 1
+
 // op codes
 const (
 	opHeartbeat    = 0
@@ -215,6 +241,9 @@ const (
 	opAck          = 9
 	opError        = 10
 	opDisconnect   = 11
+	opRequest      = 13
+	opRequestReply = 14
+	opReply        = 15
 	opMapCreate    = 16
 	opMapDestroy   = 18
 	opMapSet       = 20
@@ -225,7 +254,7 @@ const (
 
 // Default constants.
 const (
-	DefaultTimeout           = 10 * time.Second
+	DefaultTimeout           = 60 * time.Second
 	DefaultHandshakeTimeout  = 10 * time.Second
 	DefaultReconnectAttempts = 5
 	DefaultReconnectMaxDelay = 30 * time.Second
@@ -330,6 +359,97 @@ func (conn *Connection) IsConnected() bool {
 	return conn.connected
 }
 
+// Publish a request message and wait for a reply.
+func (conn *Connection) SendRequest(request Message, timeout time.Duration) (Message, error) {
+	completionChan := make(chan *Completion, 1)
+	if err := conn.SendRequestAsync(request, completionChan); err != nil {
+		return nil, err
+	}
+	select {
+	case completion := <-completionChan:
+		return completion.Message, completion.Error
+	case <-time.After(timeout):
+		return nil, ErrTimeout
+	}
+}
+
+// Publish a request message asynchronously. The completionChan will
+// receive notification once the reply has been received.
+func (conn *Connection) SendRequestAsync(request Message, completionChan chan *Completion) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.connected {
+		return ErrNotConnected
+	}
+	if conn.protocol < 1 {
+		return ErrNotSupported
+	}
+	// register the publish
+	conn.reqSeqNum++
+	conn.reqs[conn.reqSeqNum] = &Completion{
+		request: Message{
+			"op":   opRequest,
+			"seq":  conn.reqSeqNum,
+			"body": request,
+		},
+		seqNum:         conn.reqSeqNum,
+		completionChan: completionChan,
+	}
+	// send publish message
+	conn.sendMessage(conn.reqs[conn.reqSeqNum].request)
+	return nil
+}
+
+// Send a reply message in response to a request message.
+func (conn *Connection) SendReply(reply, request Message) error {
+	completionChan := make(chan *Completion, 1)
+	if err := conn.SendReplyAsync(reply, request, completionChan); err != nil {
+		return err
+	}
+	select {
+	case completion := <-completionChan:
+		return completion.Error
+	case <-time.After(conn.Options.Timeout):
+		return ErrTimeout
+	}
+}
+
+// Send a reply message asynchronously in response to a request message.
+// The optional completionChan will receive notification once the send
+// operation completes.
+func (conn *Connection) SendReplyAsync(reply, request Message, completionChan chan *Completion) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.connected {
+		return ErrNotConnected
+	}
+	if conn.protocol < 1 {
+		return ErrNotSupported
+	}
+	replyTo, ok := request[replyToHeader].(string)
+	if !ok {
+		return ErrNotRequest
+	}
+	reqId, _ := request[requestIdHeader].(int64)
+	// register the publish
+	conn.reqSeqNum++
+	conn.reqs[conn.reqSeqNum] = &Completion{
+		Message: reply,
+		request: Message{
+			"op":   opReply,
+			"seq":  conn.reqSeqNum,
+			"to":   replyTo,
+			"req":  reqId,
+			"body": reply,
+		},
+		seqNum:         conn.reqSeqNum,
+		completionChan: completionChan,
+	}
+	// send publish message
+	conn.sendMessage(conn.reqs[conn.reqSeqNum].request)
+	return nil
+}
+
 // Publish an application message.
 func (conn *Connection) Publish(msg Message) error {
 	completionChan := make(chan *Completion, 1)
@@ -375,16 +495,7 @@ func (conn *Connection) PublishAsync(msg Message, completionChan chan *Completio
 // A durable name can be specified to create a durable subscription.
 // Messages are received on the messageChan.
 func (conn *Connection) Subscribe(matcher string, durable string, messageChan chan Message) (*Subscription, error) {
-	subscriptionChan := make(chan *Subscription, 1)
-	if err := conn.SubscribeAsync(matcher, durable, messageChan, subscriptionChan); err != nil {
-		return nil, err
-	}
-	select {
-	case sub := <-subscriptionChan:
-		return sub, sub.Error
-	case <-time.After(conn.Options.Timeout):
-		return nil, ErrTimeout
-	}
+	return conn.SubscribeWithOptions(matcher, durable, SubscriptionOptions{}, messageChan)
 }
 
 // Subscribe registers interest in application messages asynchronously.
@@ -393,25 +504,7 @@ func (conn *Connection) Subscribe(matcher string, durable string, messageChan ch
 // Messages are received on the messageChan. The subscriptionChan
 // will receive notification once the subscribe operation completes.
 func (conn *Connection) SubscribeAsync(matcher string, durable string, messageChan chan Message, subscriptionChan chan *Subscription) error {
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-	if !conn.connected {
-		return ErrNotConnected
-	}
-	// register the subscription
-	conn.subSeqNum++
-	sid := strconv.FormatInt(conn.subSeqNum, 10)
-	sub := &Subscription{
-		Matcher:          matcher,
-		Durable:          durable,
-		MessageChan:      messageChan,
-		subscriptionID:   sid,
-		subscriptionChan: subscriptionChan,
-	}
-	conn.subs[sid] = sub
-	// send subscribe protocol
-	conn.sendMessage(sub.toProtocol())
-	return nil
+	return conn.SubscribeWithOptionsAsync(matcher, durable, SubscriptionOptions{}, messageChan, subscriptionChan)
 }
 
 // Subscribe registers interest in application messages.
@@ -420,15 +513,16 @@ func (conn *Connection) SubscribeAsync(matcher string, durable string, messageCh
 // Messages are received on the messageChan.
 //
 func (conn *Connection) SubscribeWithOptions(matcher string, durable string, options SubscriptionOptions, messageChan chan Message) (*Subscription, error) {
-	subscriptionChan := make(chan *Subscription, 1)
-	if err := conn.SubscribeWithOptionsAsync(matcher, durable, options, messageChan, subscriptionChan); err != nil {
-		return nil, err
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.connected {
+		return nil, ErrNotConnected
 	}
+	subscriptionChan := make(chan *Subscription, 1)
+	conn.subscribe(matcher, durable, options, messageChan, subscriptionChan)
 	select {
 	case sub := <-subscriptionChan:
 		return sub, sub.Error
-	case <-time.After(conn.Options.Timeout):
-		return nil, ErrTimeout
 	}
 }
 
@@ -444,24 +538,13 @@ func (conn *Connection) SubscribeWithOptionsAsync(matcher string, durable string
 	if !conn.connected {
 		return ErrNotConnected
 	}
-	// register the subscription
-	conn.subSeqNum++
-	sid := strconv.FormatInt(conn.subSeqNum, 10)
-	sub := &Subscription{
-		Matcher:          matcher,
-		Durable:          durable,
-		Options:          options,
-		MessageChan:      messageChan,
-		subscriptionID:   sid,
-		subscriptionChan: subscriptionChan,
-	}
-	conn.subs[sid] = sub
-	// send subscribe protocol
-	conn.sendMessage(sub.toProtocol())
+	conn.subscribe(matcher, durable, options, messageChan, subscriptionChan)
 	return nil
 }
 
-// Unsubscribe unregisters the subscription.
+// Unsubscribe unregisters the subscription. For durable subscriptions,
+// the persistence service will remove the durable subscription as well,
+// along with any persisted messsages.
 func (conn *Connection) Unsubscribe(sub *Subscription) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -478,7 +561,9 @@ func (conn *Connection) Unsubscribe(sub *Subscription) error {
 	return nil
 }
 
-// UnsubscribeAll unregisters all subscriptions.
+// UnsubscribeAll unregisters all subscriptions. For durable subscriptions,
+// the persistence service will remove the durable subscription as well,
+// along with any persisted messages.
 func (conn *Connection) UnsubscribeAll() error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
@@ -504,7 +589,7 @@ func (conn *Connection) Acknowledge(msg Message) error {
 	if !conn.connected {
 		return ErrNotConnected
 	}
-	seq, ok := msg["_eftl:sequenceNumber"].(int64)
+	seq, ok := msg[sequenceNumberHeader].(int64)
 	if !ok {
 		return nil
 	}
@@ -523,11 +608,11 @@ func (conn *Connection) AcknowledgeAll(msg Message) error {
 	if !conn.connected {
 		return ErrNotConnected
 	}
-	seq, ok := msg["_eftl:sequenceNumber"].(int64)
+	seq, ok := msg[sequenceNumberHeader].(int64)
 	if !ok {
 		return nil
 	}
-	sid, ok := msg["_eftl:subscriptionId"].(string)
+	sid, ok := msg[subscriptionIdHeader].(string)
 	if !ok {
 		return nil
 	}
@@ -538,6 +623,25 @@ func (conn *Connection) AcknowledgeAll(msg Message) error {
 		"id":  sid,
 	})
 	return nil
+}
+
+func (conn *Connection) subscribe(matcher string, durable string, options SubscriptionOptions, messageChan chan Message, subscriptionChan chan *Subscription) *Subscription {
+	// register the subscription
+	conn.subSeqNum++
+	sid := strconv.FormatInt(conn.subSeqNum, 10)
+	sub := &Subscription{
+		Matcher:          matcher,
+		Durable:          durable,
+		Options:          options,
+		MessageChan:      messageChan,
+		subscriptionID:   sid,
+		subscriptionChan: subscriptionChan,
+		pending:          true,
+	}
+	conn.subs[sid] = sub
+	// send subscribe protocol
+	conn.sendMessage(sub.toProtocol())
+	return sub
 }
 
 func (conn *Connection) connect(uri *url.URL) error {
@@ -566,6 +670,7 @@ func (conn *Connection) connect(uri *url.URL) error {
 	// send login message
 	msg := Message{
 		"op":             opLogin,
+		"protocol":       protocolVer,
 		"client_type":    "golang",
 		"client_version": Version,
 		"login_options": Message{
@@ -587,6 +692,9 @@ func (conn *Connection) connect(uri *url.URL) error {
 		msg["client_id"] = uri.Query().Get("clientId")
 	} else if conn.Options.ClientID != "" {
 		msg["client_id"] = conn.Options.ClientID
+	}
+	if conn.Options.MaxPendingAcks > 0 {
+		msg["max_pending_acks"] = conn.Options.MaxPendingAcks
 	}
 	if conn.reconnectID != "" {
 		msg["id_token"] = conn.reconnectID
@@ -610,6 +718,10 @@ func (conn *Connection) connect(uri *url.URL) error {
 	// client id
 	if val, ok := msg["client_id"].(string); ok {
 		conn.Options.ClientID = val
+	}
+	// protocol
+	if val, ok := msg["protocol"].(int64); ok {
+		conn.protocol = val
 	}
 	// token id
 	if val, ok := msg["id_token"].(string); ok {
@@ -674,7 +786,8 @@ func (conn *Connection) dispatch() {
 		// read the next message
 		msg, err := conn.nextMessage(conn.timeout)
 		if err != nil {
-			// reconnect when the close code reflects a server shutdown
+			// if a websocket close code is received from the
+			// server only reconnect if the code is a server restart
 			if e, ok := err.(*eftlError); ok && e != ErrRestart {
 				conn.handleDisconnect(err)
 			} else {
@@ -695,6 +808,8 @@ func (conn *Connection) dispatch() {
 				conn.handleUnsubscribed(msg)
 			case opAck:
 				conn.handleAck(msg)
+			case opRequestReply:
+				conn.handleReply(msg)
 			case opError:
 				conn.handleError(msg)
 			case opMapResponse:
@@ -705,7 +820,8 @@ func (conn *Connection) dispatch() {
 }
 
 func (conn *Connection) handleReconnect(err error) {
-	if conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+	conn.mu.Lock()
+	if conn.connected && conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
 		// add jitter by applying a randomness factor of 0.5
 		jitter := rand.Float64() + 0.5
 		// exponential backoff truncated to max delay
@@ -722,7 +838,9 @@ func (conn *Connection) handleReconnect(err error) {
 			}
 			conn.handleReconnect(err)
 		})
+		conn.mu.Unlock()
 	} else {
+		conn.mu.Unlock()
 		conn.handleDisconnect(err)
 	}
 }
@@ -762,11 +880,21 @@ func (conn *Connection) handleMessage(msg Message) {
 	seq, _ := msg["seq"].(int64)
 	body, _ := msg["body"].(Message)
 	sid, _ := msg["to"].(string)
+	replyTo, _ := msg["reply_to"].(string)
+	reqId, _ := msg["req"].(int64)
+	msgId, _ := msg["sid"].(int64)
 	if sub, ok := conn.subs[sid]; ok {
 		if seq == 0 || seq > sub.lastSeqNum {
+			if msgId != 0 {
+				body[storeMessageIdHeader] = msgId
+			}
 			if !sub.autoAck() && seq != 0 {
-				body["_eftl:sequenceNumber"] = seq
-				body["_eftl:subscriptionId"] = sid
+				body[sequenceNumberHeader] = seq
+				body[subscriptionIdHeader] = sid
+			}
+			if replyTo != "" {
+				body[replyToHeader] = replyTo
+				body[requestIdHeader] = reqId
 			}
 			if sub.MessageChan != nil {
 				sub.MessageChan <- body
@@ -791,7 +919,8 @@ func (conn *Connection) handleSubscribed(msg Message) {
 	defer conn.mu.Unlock()
 	if sid, ok := msg["id"].(string); ok {
 		if sub, ok := conn.subs[sid]; ok {
-			if sub.subscriptionChan != nil {
+			if sub.subscriptionChan != nil && sub.pending {
+				sub.pending = false
 				select {
 				case sub.subscriptionChan <- sub:
 				default:
@@ -807,13 +936,17 @@ func (conn *Connection) handleUnsubscribed(msg Message) {
 	if sid, ok := msg["id"].(string); ok {
 		if sub, ok := conn.subs[sid]; ok {
 			errCode, _ := msg["err"].(int64)
-			if errCode == 12 {
+			if errCode == ErrCodeSubscriptionDisallowed {
 				sub.Error = ErrNotAuthorized
 			} else {
 				reason, _ := msg["reason"].(string)
 				sub.Error = fmt.Errorf("%d: %s", errCode, reason)
 			}
-			delete(conn.subs, sid)
+			if errCode == ErrCodeSubscriptionInvalid {
+				// remove the subscription only if it's untryable
+				delete(conn.subs, sid)
+			}
+			sub.pending = true
 			if sub.subscriptionChan != nil {
 				select {
 				case sub.subscriptionChan <- sub:
@@ -830,7 +963,7 @@ func (conn *Connection) handleAck(msg Message) {
 	if seq, ok := msg["seq"].(int64); ok {
 		var err error
 		if errCode, ok := msg["err"].(int64); ok {
-			if errCode == 12 {
+			if errCode == ErrCodePublishDisallowed {
 				err = ErrNotAuthorized
 			} else {
 				reason, _ := msg["reason"].(string)
@@ -839,6 +972,35 @@ func (conn *Connection) handleAck(msg Message) {
 		}
 		if comp, ok := conn.reqs[seq]; ok {
 			comp.Error = err
+			if comp.completionChan != nil {
+				select {
+				case comp.completionChan <- comp:
+				default:
+				}
+			}
+			delete(conn.reqs, seq)
+		}
+	}
+}
+
+func (conn *Connection) handleReply(msg Message) {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if seq, ok := msg["seq"].(int64); ok {
+		var err error
+		if errCode, ok := msg["err"].(int64); ok {
+			if errCode == ErrCodeRequestDisallowed {
+				err = ErrNotAuthorized
+			} else {
+				reason, _ := msg["reason"].(string)
+				err = fmt.Errorf("%d: %s", errCode, reason)
+			}
+		}
+		if comp, ok := conn.reqs[seq]; ok {
+			comp.Error = err
+			if body, ok := msg["body"].(Message); ok {
+				comp.Message = body
+			}
 			if comp.completionChan != nil {
 				select {
 				case comp.completionChan <- comp:
@@ -866,7 +1028,7 @@ func (conn *Connection) handleMapResponse(msg Message) {
 	if seq, ok := msg["seq"].(int64); ok {
 		var err error
 		if errCode, ok := msg["err"].(int64); ok {
-			if errCode == 14 {
+			if errCode == ErrCodeMapRequestDisallowed {
 				err = ErrNotAuthorized
 			} else {
 				reason, _ := msg["reason"].(string)
@@ -906,6 +1068,8 @@ func (conn *Connection) nextMessage(timeout time.Duration) (msg Message, err err
 	// translate a websocket.CloseError
 	if closeErr, ok := err.(*websocket.CloseError); ok {
 		switch closeErr.Code {
+		case websocket.CloseGoingAway:
+			err = ErrGoingAway
 		case websocket.CloseMessageTooBig:
 			err = ErrMessageTooBig
 		case websocket.CloseServiceRestart:
