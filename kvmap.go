@@ -26,7 +26,7 @@ func (conn *Connection) KVMap(name string) *KVMap {
 func (conn *Connection) RemoveKVMap(name string) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	conn.sendMessage(Message{
@@ -54,7 +54,7 @@ func (m *KVMap) SetAsync(key string, msg Message, completionChan chan *Completio
 	conn := m.conn
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	// register the request
@@ -93,7 +93,7 @@ func (m *KVMap) GetAsync(key string, completionChan chan *Completion) error {
 	conn := m.conn
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	// register the request
@@ -130,7 +130,7 @@ func (m *KVMap) RemoveAsync(key string, completionChan chan *Completion) error {
 	conn := m.conn
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	// register the request

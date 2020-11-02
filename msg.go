@@ -19,6 +19,7 @@ import (
 const headerPrefix = "_eftl:"
 
 const (
+	deliveryCountHeader  = headerPrefix + "deliveryCount"
 	storeMessageIdHeader = headerPrefix + "storeMessageId"
 	sequenceNumberHeader = headerPrefix + "sequenceNumber"
 	subscriptionIdHeader = headerPrefix + "subscriptionId"
@@ -97,6 +98,12 @@ type Message map[string]interface{}
 func (msg Message) StoreMessageId() int64 {
 	msgId, _ := msg[storeMessageIdHeader].(int64)
 	return msgId
+}
+
+// Delivery count assigned by the persistence service.
+func (msg Message) DeliveryCount() int64 {
+	deliveryCount, _ := msg[deliveryCountHeader].(int64)
+	return deliveryCount
 }
 
 // MarshalJSON encodes the message into JSON.

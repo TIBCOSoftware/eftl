@@ -59,6 +59,37 @@ const (
 	ErrCodeRequestFailed          = 41
 )
 
+// State of the connection.
+type State int
+
+const (
+	DISCONNECTED = State(iota)
+	CONNECTING
+	CONNECTED
+	DISCONNECTING
+	RECONNECTING
+)
+
+func (e State) String() string {
+	switch e {
+	case DISCONNECTED:
+		return "disconnected"
+	case CONNECTING:
+		return "connecting"
+	case CONNECTED:
+		return "connected"
+	case DISCONNECTING:
+		return "disconnecting"
+	case RECONNECTING:
+		return "reconnecting"
+	default:
+		return fmt.Sprintf("%d", int(e))
+	}
+}
+
+// StateChangeHandler is invoked whenever the connection state changes.
+type StateChangeHandler func(*Connection, State)
+
 // Options available to configure the connection.
 type Options struct {
 	// Username for authenticating with the server if not specified with
@@ -88,7 +119,7 @@ type Options struct {
 
 	// AutoReconnectAttempts specifies the number of times the client attempts to
 	// automatically reconnect to the server following a loss of connection.
-	// The default is 5 attempts.
+	// The default is 256 attempts.
 	AutoReconnectAttempts int64
 
 	// AutoReconnectMaxDelay determines the maximum delay between autoreconnect attempts.
@@ -102,6 +133,9 @@ type Options struct {
 	// additional messages until previously received messages are acknowledged.
 	// If not specified the server's configured value will be used.
 	MaxPendingAcks int32
+
+	// OnStateChange is invoked whenever the connection state changes.
+	OnStateChange StateChangeHandler
 }
 
 // DefaultOptions returns the default connection options.
@@ -126,7 +160,7 @@ type Connection struct {
 	ws                *websocket.Conn
 	urlList           []*url.URL
 	urlIndex          int
-	connected         bool
+	state             State
 	timeout           time.Duration
 	reqs              requests
 	reqSeqNum         int64
@@ -256,7 +290,7 @@ const (
 const (
 	DefaultTimeout           = 60 * time.Second
 	DefaultHandshakeTimeout  = 10 * time.Second
-	DefaultReconnectAttempts = 5
+	DefaultReconnectAttempts = 256
 	DefaultReconnectMaxDelay = 30 * time.Second
 )
 
@@ -301,12 +335,16 @@ func Connect(urlStr string, opts *Options, errorChan chan error) (*Connection, e
 	if conn.Options.HandshakeTimeout == 0 {
 		conn.Options.HandshakeTimeout = DefaultHandshakeTimeout
 	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	// connect to the server
+	conn.setState(CONNECTING)
 	for _, url := range conn.urlList {
 		if err = conn.connect(url); err == nil {
 			return conn, nil // success
 		}
 	}
+	conn.setState(DISCONNECTED)
 	return nil, err
 }
 
@@ -317,26 +355,29 @@ func Connect(urlStr string, opts *Options, errorChan chan error) (*Connection, e
 func (conn *Connection) Reconnect() error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if conn.connected {
+	if conn.isConnected() {
 		return nil
 	}
 	var err error
 	// connect to the server
+	conn.setState(CONNECTING)
 	for _, url := range conn.urlList {
 		if err = conn.connect(url); err == nil {
 			return nil // success
 		}
 	}
+	conn.setState(DISCONNECTED)
 	return err
 }
 
 // Disconnect closes the connection to the server.
 func (conn *Connection) Disconnect() {
 	conn.mu.Lock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		conn.mu.Unlock()
 		return
 	}
+	conn.setState(DISCONNECTING)
 	// send disconnect message
 	conn.sendMessage(Message{
 		"op": opDisconnect,
@@ -356,7 +397,7 @@ func (conn *Connection) Disconnect() {
 func (conn *Connection) IsConnected() bool {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	return conn.connected
+	return conn.isConnected()
 }
 
 // Publish a request message and wait for a reply.
@@ -378,7 +419,7 @@ func (conn *Connection) SendRequest(request Message, timeout time.Duration) (Mes
 func (conn *Connection) SendRequestAsync(request Message, completionChan chan *Completion) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	if conn.protocol < 1 {
@@ -420,7 +461,7 @@ func (conn *Connection) SendReply(reply, request Message) error {
 func (conn *Connection) SendReplyAsync(reply, request Message, completionChan chan *Completion) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	if conn.protocol < 1 {
@@ -470,7 +511,7 @@ func (conn *Connection) Publish(msg Message) error {
 func (conn *Connection) PublishAsync(msg Message, completionChan chan *Completion) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	// register the publish
@@ -515,7 +556,7 @@ func (conn *Connection) SubscribeAsync(matcher string, durable string, messageCh
 func (conn *Connection) SubscribeWithOptions(matcher string, durable string, options SubscriptionOptions, messageChan chan Message) (*Subscription, error) {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return nil, ErrNotConnected
 	}
 	subscriptionChan := make(chan *Subscription, 1)
@@ -535,10 +576,60 @@ func (conn *Connection) SubscribeWithOptions(matcher string, durable string, opt
 func (conn *Connection) SubscribeWithOptionsAsync(matcher string, durable string, options SubscriptionOptions, messageChan chan Message, subscriptionChan chan *Subscription) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	conn.subscribe(matcher, durable, options, messageChan, subscriptionChan)
+	return nil
+}
+
+// Close the subscription. For durable subscriptions, the persistence service
+// will not remove the durable subscription allowing the durable subscription
+// to continue accumulating persisted messages. Any unacknowledged messages
+// will be made available for redelivery.
+func (conn *Connection) CloseSubscription(sub *Subscription) error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.isConnected() {
+		return ErrNotConnected
+	}
+	if conn.protocol < 1 {
+		return ErrNotSupported
+	}
+	// send unsubscribe protocol
+	conn.sendMessage(Message{
+		"op":  opUnsubscribe,
+		"id":  sub.subscriptionID,
+		"del": "false",
+	})
+	// unregister the subscription
+	delete(conn.subs, sub.subscriptionID)
+	return nil
+}
+
+// Close all subscriptions. For durable subscriptions, the persistence service
+// will not remove the durable subscriptions allowing the durable subscriptions
+// to continue accumulating persisted messages. Any unacknowledged messages
+// will be made available for redelivery.
+func (conn *Connection) CloseAllSubscriptions() error {
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	if !conn.isConnected() {
+		return ErrNotConnected
+	}
+	if conn.protocol < 1 {
+		return ErrNotSupported
+	}
+	for _, sub := range conn.subs {
+		// send unsubscribe protocol
+		conn.sendMessage(Message{
+			"op":  opUnsubscribe,
+			"id":  sub.subscriptionID,
+			"del": "false",
+		})
+		// unregister the subscription
+		delete(conn.subs, sub.subscriptionID)
+	}
 	return nil
 }
 
@@ -548,7 +639,7 @@ func (conn *Connection) SubscribeWithOptionsAsync(matcher string, durable string
 func (conn *Connection) Unsubscribe(sub *Subscription) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	// send unsubscribe protocol
@@ -567,7 +658,7 @@ func (conn *Connection) Unsubscribe(sub *Subscription) error {
 func (conn *Connection) UnsubscribeAll() error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	for _, sub := range conn.subs {
@@ -586,7 +677,7 @@ func (conn *Connection) UnsubscribeAll() error {
 func (conn *Connection) Acknowledge(msg Message) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	seq, ok := msg[sequenceNumberHeader].(int64)
@@ -605,7 +696,7 @@ func (conn *Connection) Acknowledge(msg Message) error {
 func (conn *Connection) AcknowledgeAll(msg Message) error {
 	conn.mu.Lock()
 	defer conn.mu.Unlock()
-	if !conn.connected {
+	if !conn.isConnected() {
 		return ErrNotConnected
 	}
 	seq, ok := msg[sequenceNumberHeader].(int64)
@@ -623,6 +714,20 @@ func (conn *Connection) AcknowledgeAll(msg Message) error {
 		"id":  sid,
 	})
 	return nil
+}
+
+func (conn *Connection) setState(state State) {
+	if conn.state != state {
+		conn.state = state
+		// optional user callback
+		if conn.Options.OnStateChange != nil {
+			conn.Options.OnStateChange(conn, conn.state)
+		}
+	}
+}
+
+func (conn *Connection) isConnected() bool {
+	return conn.state == CONNECTED || conn.state == RECONNECTING
 }
 
 func (conn *Connection) subscribe(matcher string, durable string, options SubscriptionOptions, messageChan chan Message, subscriptionChan chan *Subscription) *Subscription {
@@ -737,36 +842,20 @@ func (conn *Connection) connect(uri *url.URL) error {
 		resume, _ = strconv.ParseBool(val)
 	}
 	// mark the connection as connected
-	conn.connected = true
+	conn.setState(CONNECTED)
 	// reset the reconnect attempts
 	conn.reconnectAttempts = 0
 	// re-establish subscriptions
 	for _, sub := range conn.subs {
-		conn.sendMessage(sub.toProtocol())
-	}
-	if resume {
-		// re-send unacknowledged messages
-		conn.reqs.iterate(func(comp *Completion) {
-			conn.sendMessage(comp.request)
-		})
-	} else {
-		// notify unacknowledged messages
-		conn.reqs.iterate(func(comp *Completion) {
-			comp.Error = ErrReconnect
-			if comp.completionChan != nil {
-				select {
-				case comp.completionChan <- comp:
-				default:
-				}
-			}
-		})
-		conn.reqs = make(requests)
-
-		// reset subscription last sequence number
-		for _, sub := range conn.subs {
+		if !resume {
 			sub.lastSeqNum = 0
 		}
+		conn.sendMessage(sub.toProtocol())
 	}
+	// re-send unacknowledged messages
+	conn.reqs.iterate(func(comp *Completion) {
+		conn.sendMessage(comp.request)
+	})
 	// process incoming messages
 	conn.wg.Add(1)
 	go conn.dispatch()
@@ -775,7 +864,7 @@ func (conn *Connection) connect(uri *url.URL) error {
 
 func (conn *Connection) disconnect() error {
 	// mark the connection as not connected
-	conn.connected = false
+	conn.setState(DISCONNECTED)
 	// disconnect from the server
 	return conn.ws.Close()
 }
@@ -786,13 +875,18 @@ func (conn *Connection) dispatch() {
 		// read the next message
 		msg, err := conn.nextMessage(conn.timeout)
 		if err != nil {
-			// if a websocket close code is received from the
-			// server only reconnect if the code is a server restart
-			if e, ok := err.(*eftlError); ok && e != ErrRestart {
-				conn.handleDisconnect(err)
-			} else {
-				conn.handleReconnect(err)
+			conn.mu.Lock()
+			if conn.isConnected() {
+				conn.disconnect()
+				// if a websocket close code is received from the
+				// server only reconnect if the code is a server restart
+				if e, ok := err.(*eftlError); ok && e != ErrRestart {
+					conn.handleDisconnect(err)
+				} else {
+					conn.handleReconnect(err)
+				}
 			}
+			conn.mu.Unlock()
 			break
 		}
 		// process the message
@@ -820,8 +914,8 @@ func (conn *Connection) dispatch() {
 }
 
 func (conn *Connection) handleReconnect(err error) {
-	conn.mu.Lock()
-	if conn.connected && conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+	if conn.reconnectAttempts < conn.Options.AutoReconnectAttempts {
+		conn.setState(RECONNECTING)
 		// add jitter by applying a randomness factor of 0.5
 		jitter := rand.Float64() + 0.5
 		// exponential backoff truncated to max delay
@@ -831,41 +925,37 @@ func (conn *Connection) handleReconnect(err error) {
 		}
 		conn.reconnectAttempts++
 		conn.reconnectTimer = time.AfterFunc(dur, func() {
+			conn.mu.Lock()
+			defer conn.mu.Unlock()
 			for _, url := range conn.urlList {
 				if e := conn.connect(url); e == nil {
 					return
 				}
 			}
+			conn.setState(DISCONNECTED)
 			conn.handleReconnect(err)
 		})
-		conn.mu.Unlock()
 	} else {
-		conn.mu.Unlock()
 		conn.handleDisconnect(err)
 	}
 }
 
 func (conn *Connection) handleDisconnect(err error) {
-	conn.mu.Lock()
-	defer conn.mu.Unlock()
-	if conn.connected {
-		conn.disconnect()
-		// send notification to the error channel
-		if conn.ErrorChan != nil {
-			conn.ErrorChan <- err
-		}
-		// clear pending completions
-		conn.reqs.iterate(func(comp *Completion) {
-			comp.Error = err
-			if comp.completionChan != nil {
-				select {
-				case comp.completionChan <- comp:
-				default:
-				}
-			}
-		})
-		conn.reqs = make(requests)
+	// send notification to the error channel
+	if conn.ErrorChan != nil {
+		conn.ErrorChan <- err
 	}
+	// clear pending completions
+	conn.reqs.iterate(func(comp *Completion) {
+		comp.Error = err
+		if comp.completionChan != nil {
+			select {
+			case comp.completionChan <- comp:
+			default:
+			}
+		}
+	})
+	conn.reqs = make(requests)
 }
 
 func (conn *Connection) handleHeartbeat(msg Message) {
@@ -883,10 +973,14 @@ func (conn *Connection) handleMessage(msg Message) {
 	replyTo, _ := msg["reply_to"].(string)
 	reqId, _ := msg["req"].(int64)
 	msgId, _ := msg["sid"].(int64)
+	deliveryCount, _ := msg["cnt"].(int64)
 	if sub, ok := conn.subs[sid]; ok {
 		if seq == 0 || seq > sub.lastSeqNum {
 			if msgId != 0 {
 				body[storeMessageIdHeader] = msgId
+			}
+			if deliveryCount != 0 {
+				body[deliveryCountHeader] = deliveryCount
 			}
 			if !sub.autoAck() && seq != 0 {
 				body[sequenceNumberHeader] = seq
