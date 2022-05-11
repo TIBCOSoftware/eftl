@@ -1,6 +1,9 @@
-// Copyright © 2017-2020. TIBCO Software Inc.
-// This file is subject to the license terms contained
-// in the license file that is distributed with this file.
+//
+// Copyright (c) 2001-$Date: 2020-09-24 12:20:18 -0700 (Thu, 24 Sep 2020) $ TIBCO Software Inc.
+// Licensed under a BSD-style license. Refer to [LICENSE]
+// For more information, please contact:
+// TIBCO Software Inc., Palo Alto, California, USA
+//
 
 package eftl
 
